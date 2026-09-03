@@ -2,6 +2,7 @@ use image::{RgbImage, RgbaImage};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+use rayon::prelude::*;
 
 /// RGB pixel framebuffer with z-buffer for software rasterization.
 ///
@@ -180,18 +181,18 @@ impl Framebuffer {
     /// Background pixels (depth == INFINITY) remain unchanged (black).
     pub fn apply_depth_tint(&mut self, fog_color: [u8; 3], fog_strength: f64) {
         // Find z_min and z_max across all valid (non-background) pixels.
-        let mut z_min = f32::INFINITY;
-        let mut z_max = f32::NEG_INFINITY;
-        for &d in &self.depth {
-            if d < f32::INFINITY {
-                if d < z_min {
-                    z_min = d;
-                }
-                if d > z_max {
-                    z_max = d;
-                }
-            }
-        }
+        let (z_min, z_max) = self
+            .depth
+            .par_iter()
+            .filter(|d| **d < f32::INFINITY)
+            .fold(
+                || (f32::INFINITY, f32::NEG_INFINITY),
+                |(lo, hi), &d| (lo.min(d), hi.max(d)),
+            )
+            .reduce(
+                || (f32::INFINITY, f32::NEG_INFINITY),
+                |a, b| (a.0.min(b.0), a.1.max(b.1)),
+            );
 
         // No valid pixels, or all at the same depth — nothing to tint.
         let z_range = z_max - z_min;
@@ -201,21 +202,23 @@ impl Framebuffer {
 
         let inv_range = 1.0 / z_range;
 
-        for i in 0..self.depth.len() {
-            let d = self.depth[i];
-            if d >= f32::INFINITY {
-                continue; // background pixel — leave black
-            }
-            let t = ((d - z_min) * inv_range).clamp(0.0, 1.0);
-            let blend = t as f64 * fog_strength;
-            let c = &mut self.color[i];
-            c[0] =
-                (c[0] as f64 + (fog_color[0] as f64 - c[0] as f64) * blend).clamp(0.0, 255.0) as u8;
-            c[1] =
-                (c[1] as f64 + (fog_color[1] as f64 - c[1] as f64) * blend).clamp(0.0, 255.0) as u8;
-            c[2] =
-                (c[2] as f64 + (fog_color[2] as f64 - c[2] as f64) * blend).clamp(0.0, 255.0) as u8;
-        }
+        // Per-pixel and independent -- parallelize over rows.
+        self.color
+            .par_iter_mut()
+            .zip(self.depth.par_iter())
+            .for_each(|(c, &d)| {
+                if d >= f32::INFINITY {
+                    return; // background pixel — leave black
+                }
+                let t = ((d - z_min) * inv_range).clamp(0.0, 1.0);
+                let blend = t as f64 * fog_strength;
+                c[0] = (c[0] as f64 + (fog_color[0] as f64 - c[0] as f64) * blend).clamp(0.0, 255.0)
+                    as u8;
+                c[1] = (c[1] as f64 + (fog_color[1] as f64 - c[1] as f64) * blend).clamp(0.0, 255.0)
+                    as u8;
+                c[2] = (c[2] as f64 + (fog_color[2] as f64 - c[2] as f64) * blend).clamp(0.0, 255.0)
+                    as u8;
+            });
     }
 
     /// Cohen-Sutherland line clipping against framebuffer bounds [0, width) x [0, height).
@@ -534,14 +537,43 @@ impl Framebuffer {
     /// ratatui-image integration to send the framebuffer to the terminal via
     /// Sixel, Kitty, or other graphics protocols.
     pub fn to_rgb_image(&self) -> RgbImage {
-        let mut img = RgbImage::new(self.width as u32, self.height as u32);
-        for y in 0..self.height {
-            for x in 0..self.width {
-                let c = self.color[y * self.width + x];
-                img.put_pixel(x as u32, y as u32, image::Rgb(c));
-            }
-        }
-        img
+        let mut buf = vec![0u8; self.color.len() * 3];
+        buf.par_chunks_mut(3)
+            .zip(self.color.par_iter())
+            .for_each(|(out, c)| out.copy_from_slice(c));
+        RgbImage::from_raw(self.width as u32, self.height as u32, buf)
+            .expect("buffer is exactly width * height * 3 bytes")
+    }
+
+    /// Write this framebuffer into `dst` as RGBA8, one byte per channel.
+    ///
+    /// `dst` must be exactly `width * height * 4` bytes; the caller owns the
+    /// allocation, which lets the interactive path write straight into a shared
+    /// memory mapping instead of building an intermediate image.
+    ///
+    /// Background pixels (depth == INFINITY, colour == black) get alpha = 0 so
+    /// the terminal background shows through.  Drawn pixels get alpha = 255.
+    ///
+    /// # Panics
+    ///
+    /// If `dst` is not exactly `width * height * 4` bytes long.
+    pub fn write_rgba(&self, dst: &mut [u8]) {
+        assert_eq!(
+            dst.len(),
+            self.color.len() * 4,
+            "destination must be exactly width * height * 4 bytes"
+        );
+        // Per-pixel and independent; a full frame at Retina resolution is tens
+        // of megabytes, enough for the copy to be worth spreading over cores.
+        dst.par_chunks_mut(4)
+            .zip(self.color.par_iter())
+            .zip(self.depth.par_iter())
+            .for_each(|((out, c), d)| {
+                out[0] = c[0];
+                out[1] = c[1];
+                out[2] = c[2];
+                out[3] = if *d >= f32::INFINITY { 0 } else { 255 };
+            });
     }
 
     /// Convert this framebuffer into an `image::RgbaImage` with transparency.
@@ -549,20 +581,10 @@ impl Framebuffer {
     /// Background pixels (depth == INFINITY, color == black) get alpha = 0 so
     /// the terminal background shows through.  Drawn pixels get alpha = 255.
     pub fn to_rgba_image(&self) -> RgbaImage {
-        let mut img = RgbaImage::new(self.width as u32, self.height as u32);
-        for y in 0..self.height {
-            for x in 0..self.width {
-                let idx = y * self.width + x;
-                let c = self.color[idx];
-                let alpha = if self.depth[idx] >= f32::INFINITY {
-                    0
-                } else {
-                    255
-                };
-                img.put_pixel(x as u32, y as u32, image::Rgba([c[0], c[1], c[2], alpha]));
-            }
-        }
-        img
+        let mut buf = vec![0u8; self.color.len() * 4];
+        self.write_rgba(&mut buf);
+        RgbaImage::from_raw(self.width as u32, self.height as u32, buf)
+            .expect("buffer is exactly width * height * 4 bytes")
     }
 
     /// Draw a filled circle with a specific z-depth for z-buffer testing.
@@ -769,15 +791,37 @@ pub fn framebuffer_to_widget(fb: &Framebuffer) -> Paragraph<'static> {
 /// per-cell (rather than per-pixel) coloring.
 ///
 /// Consecutive cells with the same foreground color are merged into a single
-/// [`Span`] for performance (run-length encoding).  Color quantization is
-/// available via `quant_step` but currently disabled (`quant_step = 1`, a
-/// no-op).  Set it to e.g. 4 or 8 to reduce distinct colors and increase
-/// run-length merging at the expense of color precision.
-#[allow(clippy::needless_range_loop)]
+/// [`Span`] for performance (run-length encoding).
 pub fn framebuffer_to_braille_widget(fb: &Framebuffer) -> Paragraph<'static> {
+    framebuffer_to_braille_widget_ssaa(fb, 1, 1)
+}
+
+/// Supersampled variant of [`framebuffer_to_braille_widget`].
+///
+/// The framebuffer is expected to have dimensions `(cols * 2 * ssaa, rows * 4 *
+/// ssaa)`, so that each braille dot is backed by an `ssaa x ssaa` block of
+/// samples rather than a single pixel.  Each block is box-filtered: the dot is
+/// lit once the block is at least half covered, and the cell's foreground color
+/// averages every covered sample of its lit dots.  This anti-aliases silhouettes
+/// and keeps colors stable as the camera rotates, at no cost in emitted bytes --
+/// the widget is still exactly `cols x rows` braille characters.
+///
+/// `quant_step` rounds each channel to a multiple of `step` before run-length
+/// merging; `1` disables it.  Larger values merge many more cells into a single
+/// [`Span`], which cuts the number of SGR color escapes written to the terminal
+/// -- the dominant cost of this render path over SSH -- at a small loss of color
+/// precision.
+#[allow(clippy::needless_range_loop)]
+pub fn framebuffer_to_braille_widget_ssaa(
+    fb: &Framebuffer,
+    ssaa: usize,
+    quant_step: u8,
+) -> Paragraph<'static> {
+    let ssaa = ssaa.max(1);
+
     // Terminal cell grid dimensions derived from the framebuffer.
-    let term_cols = fb.width.div_ceil(2);
-    let term_rows = fb.height.div_ceil(4);
+    let term_cols = fb.width.div_ceil(2 * ssaa);
+    let term_rows = fb.height.div_ceil(4 * ssaa);
 
     if term_cols == 0 || term_rows == 0 {
         return Paragraph::new("");
@@ -795,7 +839,11 @@ pub fn framebuffer_to_braille_widget(fb: &Framebuffer) -> Paragraph<'static> {
         [0x08, 0x10, 0x20, 0x80], // column 1: rows 0-3
     ];
 
-    let quant_step: u8 = 1;
+    // Samples backing one braille dot, and the coverage needed to light it.
+    // At `ssaa == 1` the threshold is 1, i.e. "any non-black pixel lights the
+    // dot" -- identical to the non-supersampled behaviour.
+    let samples_per_dot = ssaa * ssaa;
+    let coverage_threshold = samples_per_dot.div_ceil(2) as u32;
 
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(term_rows);
 
@@ -828,24 +876,60 @@ pub fn framebuffer_to_braille_widget(fb: &Framebuffer) -> Paragraph<'static> {
             let mut g_sum: u32 = 0;
             let mut b_sum: u32 = 0;
             let mut on_count: u32 = 0;
+            // Color of the frontmost covered sample in the cell.  A braille cell
+            // carries a single foreground color, but its eight dots can straddle
+            // several structures at different depths; averaging them blends a pink
+            // helix and a green coil into brown.  Taking the nearest sample instead
+            // shows what is actually in front, and keeps colors saturated.
+            let mut cell_near_z = f32::INFINITY;
+            let mut cell_near_c = [0u8; 3];
 
             for (dx, col_bits) in BRAILLE_BITS.iter().enumerate() {
-                let px = px_base + dx;
-                if px >= fb.width {
+                let sx0 = (px_base + dx) * ssaa;
+                if sx0 >= fb.width {
                     continue;
                 }
                 for (dy, &bit) in col_bits.iter().enumerate() {
-                    let py = py_base + dy;
-                    if py >= fb.height {
+                    let sy0 = (py_base + dy) * ssaa;
+                    if sy0 >= fb.height {
                         continue;
                     }
-                    let c = fb.color[py * fb.width + px];
-                    if c != [0, 0, 0] {
+
+                    // Box-filter the sample block backing this dot.
+                    let mut covered: u32 = 0;
+                    let mut r: u32 = 0;
+                    let mut g: u32 = 0;
+                    let mut b: u32 = 0;
+                    let mut dot_near_z = f32::INFINITY;
+                    let mut dot_near_c = [0u8; 3];
+                    for sy in sy0..(sy0 + ssaa).min(fb.height) {
+                        let row = sy * fb.width;
+                        for sx in sx0..(sx0 + ssaa).min(fb.width) {
+                            let c = fb.color[row + sx];
+                            if c != [0, 0, 0] {
+                                covered += 1;
+                                r += c[0] as u32;
+                                g += c[1] as u32;
+                                b += c[2] as u32;
+                                let z = fb.depth[row + sx];
+                                if z < dot_near_z {
+                                    dot_near_z = z;
+                                    dot_near_c = c;
+                                }
+                            }
+                        }
+                    }
+
+                    if covered >= coverage_threshold {
                         bits |= bit;
-                        r_sum += c[0] as u32;
-                        g_sum += c[1] as u32;
-                        b_sum += c[2] as u32;
-                        on_count += 1;
+                        r_sum += r;
+                        g_sum += g;
+                        b_sum += b;
+                        on_count += covered;
+                        if dot_near_z < cell_near_z {
+                            cell_near_z = dot_near_z;
+                            cell_near_c = dot_near_c;
+                        }
                     }
                 }
             }
@@ -866,14 +950,18 @@ pub fn framebuffer_to_braille_widget(fb: &Framebuffer) -> Paragraph<'static> {
                 }
             } else {
                 // Compute average color of "on" pixels.
-                let avg = quantize_color(
+                // Fall back to the mean when no covered sample carried a finite
+                // depth -- a framebuffer whose colors were written without z.
+                let raw = if cell_near_z.is_finite() {
+                    cell_near_c
+                } else {
                     [
                         (r_sum / on_count) as u8,
                         (g_sum / on_count) as u8,
                         (b_sum / on_count) as u8,
-                    ],
-                    quant_step,
-                );
+                    ]
+                };
+                let avg = quantize_color(raw, quant_step);
                 let cell_color = Some(avg);
 
                 let braille_char = char::from_u32(0x2800u32 + bits as u32).unwrap_or(' ');
@@ -1266,5 +1354,185 @@ mod tests {
             "negative dash_len should draw solid (got {} pixels)",
             drawn
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Supersampled braille conversion
+    // ---------------------------------------------------------------------
+
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui::widgets::Widget;
+
+    /// Render a widget into a cell buffer so the emitted glyphs and colors can
+    /// be inspected directly.
+    fn render_cells(widget: Paragraph<'static>, w: u16, h: u16) -> Buffer {
+        let area = Rect::new(0, 0, w, h);
+        let mut buf = Buffer::empty(area);
+        widget.render(area, &mut buf);
+        buf
+    }
+
+    /// Count foreground-color changes along each row. This is the quantity that
+    /// drives how many SGR escape sequences reach the terminal, i.e. the
+    /// bandwidth cost of a frame.
+    fn color_runs(buf: &Buffer, w: u16, h: u16) -> usize {
+        let mut runs = 0;
+        for y in 0..h {
+            let mut prev: Option<Color> = None;
+            for x in 0..w {
+                let fg = buf[(x, y)].fg;
+                if prev != Some(fg) {
+                    runs += 1;
+                    prev = Some(fg);
+                }
+            }
+        }
+        runs
+    }
+
+    #[test]
+    fn ssaa_one_lights_a_dot_from_any_non_black_pixel() {
+        // At ssaa == 1 the coverage threshold is 1, preserving the original
+        // "any non-black pixel lights the dot" behaviour exactly.
+        let mut fb = Framebuffer::new(2, 4);
+        fb.color[0] = [255, 0, 0]; // dot (dx=0, dy=0) -> bit 0x01
+
+        let buf = render_cells(framebuffer_to_braille_widget(&fb), 1, 1);
+        let expected = char::from_u32(0x2800 + 0x01).unwrap().to_string();
+        assert_eq!(buf[(0, 0)].symbol(), expected);
+    }
+
+    #[test]
+    fn ssaa_dot_needs_half_coverage_to_light() {
+        // 4x8 framebuffer at ssaa = 2 is exactly one terminal cell: each of the
+        // 2x4 braille dots is backed by a 2x2 block of samples.
+        let mut fb = Framebuffer::new(4, 8);
+
+        // Dot (dx=0, dy=0) covers samples x in [0,2), y in [0,2).
+        // One covered sample out of four is 25% -- below threshold, stays dark.
+        fb.color[0] = [255, 0, 0];
+
+        // Dot (dx=1, dy=0) covers samples x in [2,4), y in [0,2).
+        // Two covered samples out of four is 50% -- lights up (bit 0x08).
+        fb.color[2] = [0, 255, 0];
+        fb.color[3] = [0, 255, 0];
+
+        let buf = render_cells(framebuffer_to_braille_widget_ssaa(&fb, 2, 1), 1, 1);
+        let expected = char::from_u32(0x2800 + 0x08).unwrap().to_string();
+        assert_eq!(
+            buf[(0, 0)].symbol(),
+            expected,
+            "only the half-covered dot should light"
+        );
+    }
+
+    #[test]
+    fn ssaa_grid_maps_to_the_same_cell_dimensions() {
+        // A supersampled framebuffer must still produce cols x rows cells --
+        // supersampling buys quality, never extra characters on the wire.
+        let (cols, rows, ssaa) = (7usize, 3usize, 2usize);
+        let fb = Framebuffer::new(cols * 2 * ssaa, rows * 4 * ssaa);
+
+        let plain = Framebuffer::new(cols * 2, rows * 4);
+        let a = render_cells(
+            framebuffer_to_braille_widget_ssaa(&fb, ssaa, 1),
+            cols as u16,
+            rows as u16,
+        );
+        let b = render_cells(
+            framebuffer_to_braille_widget(&plain),
+            cols as u16,
+            rows as u16,
+        );
+        assert_eq!(a, b, "ssaa must not change the emitted cell grid");
+    }
+
+    #[test]
+    fn quantization_merges_color_runs() {
+        // Eight cells whose colors differ by only 2 per channel -- the kind of
+        // near-identical neighbours supersampled shading produces.
+        let cols = 8usize;
+        let mut fb = Framebuffer::new(cols * 2, 4);
+        for cell in 0..cols {
+            for dx in 0..2 {
+                for dy in 0..4 {
+                    let idx = dy * fb.width + cell * 2 + dx;
+                    fb.color[idx] = [100 + 2 * cell as u8, 150, 200];
+                }
+            }
+        }
+
+        let unquantized = color_runs(
+            &render_cells(
+                framebuffer_to_braille_widget_ssaa(&fb, 1, 1),
+                cols as u16,
+                1,
+            ),
+            cols as u16,
+            1,
+        );
+        let quantized = color_runs(
+            &render_cells(
+                framebuffer_to_braille_widget_ssaa(&fb, 1, 8),
+                cols as u16,
+                1,
+            ),
+            cols as u16,
+            1,
+        );
+
+        assert_eq!(
+            unquantized, cols,
+            "every cell should differ without quantization"
+        );
+        assert!(
+            quantized < unquantized,
+            "quantization should merge runs (got {quantized}, unquantized {unquantized})"
+        );
+    }
+
+    #[test]
+    fn quantization_never_darkens_a_lit_cell_to_black() {
+        // A very dark but non-black cell must not quantize to black, which
+        // would make lit geometry invisible.
+        let mut fb = Framebuffer::new(2, 4);
+        for i in 0..fb.color.len() {
+            fb.color[i] = [1, 1, 1];
+        }
+        let buf = render_cells(framebuffer_to_braille_widget_ssaa(&fb, 1, 8), 1, 1);
+        assert_ne!(buf[(0, 0)].fg, Color::Rgb(0, 0, 0));
+    }
+
+    #[test]
+    fn cell_color_takes_the_frontmost_sample_not_the_mean() {
+        // One cell whose dots straddle two structures at different depths. The
+        // cell carries a single foreground color, so averaging a red front and a
+        // green back yields a muddy olive; it must show the front color instead.
+        let mut fb = Framebuffer::new(2, 4);
+        fb.color[0] = [255, 0, 0];
+        fb.depth[0] = 10.0; // far
+        fb.color[1] = [0, 255, 0];
+        fb.depth[1] = 1.0; // near
+
+        let buf = render_cells(framebuffer_to_braille_widget(&fb), 1, 1);
+        assert_eq!(
+            buf[(0, 0)].fg,
+            Color::Rgb(0, 255, 0),
+            "cell should take the nearer sample's color, not the blend"
+        );
+    }
+
+    #[test]
+    fn cell_color_falls_back_to_the_mean_without_depth() {
+        // A framebuffer whose colors were written without z has no frontmost
+        // sample to pick, so the mean is the only sensible answer.
+        let mut fb = Framebuffer::new(2, 4);
+        fb.color[0] = [255, 0, 0];
+        fb.color[1] = [0, 255, 0];
+        // depths left at INFINITY
+
+        let buf = render_cells(framebuffer_to_braille_widget(&fb), 1, 1);
+        assert_eq!(buf[(0, 0)].fg, Color::Rgb(127, 127, 0));
     }
 }

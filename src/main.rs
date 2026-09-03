@@ -48,7 +48,7 @@ struct Cli {
     #[arg(long, alias = "pixel")]
     fullhd: bool,
 
-    /// Render mode: braille, halfblock (or hd), fullhd (or pixel)
+    /// Render mode: braille, halfblock (or hd), hdplus (or hd+), fullhd (or pixel)
     #[arg(long = "render", value_name = "MODE")]
     render_mode: Option<String>,
 
@@ -59,6 +59,10 @@ struct Cli {
     /// Override one exact polymer residue color: CHAIN:RES[ICODE]=RRGGBB
     #[arg(long, value_name = "SELECTOR=RRGGBB")]
     residue_color: Vec<ResidueColorSpec>,
+
+    /// Palette file (TOML). Defaults to ~/.config/proteinview/palette.toml when present
+    #[arg(long, value_name = "FILE")]
+    palette: Option<PathBuf>,
 
     /// Visualization mode: cartoon, backbone, wireframe
     #[arg(long, default_value = "cartoon")]
@@ -120,18 +124,30 @@ struct Cli {
     #[arg(long)]
     log: Option<String>,
 
-    /// Number of render threads (default: 4)
-    #[arg(long, default_value = "4")]
-    threads: usize,
+    /// Number of render threads (default: one per core)
+    #[arg(long)]
+    threads: Option<usize>,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Cap rayon thread pool. 4 threads is the sweet spot: the framebuffer
-    // only has ~60 tiles (64x64) so more threads hit diminishing returns,
-    // and 4 leaves cores free for the terminal emulator and OS.
-    let num_threads = cli.threads.max(1);
+    // Resolve the color palette before anything renders.  A bad palette is a
+    // hard error rather than a silent fallback: ignoring a file the user wrote
+    // is worse than refusing to start.
+    render::palette::init(cli.palette.as_deref())?;
+
+    // Rasterization splits the framebuffer into bands, so it scales with cores
+    // until it becomes memory-bound.  Default to one thread per core: with the
+    // shared-memory transport the terminal no longer has a frame to decompress
+    // on every tick, so there is no longer a reason to hold cores back for it.
+    // Cap at 16 -- beyond that the bands get too thin to be worth a thread.
+    let num_threads = cli.threads.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map_or(4, std::num::NonZeroUsize::get)
+            .min(16)
+    });
+    let num_threads = num_threads.max(1);
     match rayon::ThreadPoolBuilder::new()
         .num_threads(num_threads)
         .build_global()
@@ -206,6 +222,7 @@ fn main() -> Result<()> {
         match mode_str.to_ascii_lowercase().as_str() {
             "braille" => RenderMode::Braille,
             "halfblock" | "hd" | "half-block" => RenderMode::HalfBlock,
+            "hdplus" | "hd+" | "halfblockplus" | "half-block-plus" => RenderMode::HalfBlockPlus,
             "fullhd" | "pixel" | "full-hd" => RenderMode::FullHD,
             _ => {
                 eprintln!("Warning: unknown render mode '{}', using default", mode_str);
@@ -347,6 +364,7 @@ fn main() -> Result<()> {
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
         let _ = execute!(io::stderr(), LeaveAlternateScreen);
+        render::kitty_shm::unlink_all();
         original_hook(info);
     }));
 
@@ -369,6 +387,15 @@ fn main() -> Result<()> {
         picker.font_size()
     );
 
+    // Ask the terminal whether it can read pixels straight out of shared
+    // memory.  Must happen here: after the picker's own query has drained its
+    // responses, and before the input thread starts consuming stdin.  Over SSH
+    // there is no shared filesystem to share memory through, so don't ask.
+    let kitty_shm = picker.protocol_type() == ratatui_image::picker::ProtocolType::Kitty
+        && connection_type == ConnectionType::Local
+        && render::kitty_shm::probe(Duration::from_millis(500));
+    log!(logfile, "kitty shared-memory transport: {}", kitty_shm);
+
     // Create app with actual terminal dimensions for dynamic zoom
     let mut app = App::new(
         protein,
@@ -383,6 +410,7 @@ fn main() -> Result<()> {
         term_rows,
         picker,
     );
+    app.kitty_shm = kitty_shm;
     log!(
         logfile,
         "app created: render_mode={:?} chains={} zoom={:.2}",
@@ -402,6 +430,9 @@ fn main() -> Result<()> {
     // when rendering is too slow (prevents PTY buffer saturation & freezes).
     let mut last_draw_duration = Duration::ZERO;
     let mut frames_to_skip: u32 = 0;
+    // Tracks the interaction state of the previous drawn frame, so the
+    // transition back to a still view can trigger one full-resolution redraw.
+    let mut was_interacting = false;
 
     loop {
         // Drain all queued input from the dedicated input thread
@@ -425,23 +456,63 @@ fn main() -> Result<()> {
                         {
                             app.should_quit = true
                         }
-                        KeyCode::Char('h') | KeyCode::Left => app.camera.rotate_y(-1.0),
-                        KeyCode::Char('l') | KeyCode::Right => app.camera.rotate_y(1.0),
-                        KeyCode::Char('j') | KeyCode::Down => app.camera.rotate_x(1.0),
-                        KeyCode::Char('k') | KeyCode::Up => app.camera.rotate_x(-1.0),
-                        KeyCode::Char('u') => app.camera.rotate_z(-1.0),
-                        KeyCode::Char('i') => app.camera.rotate_z(1.0),
-                        KeyCode::Char('+') | KeyCode::Char('=') => app.camera.zoom_in(),
-                        KeyCode::Char('-') => app.camera.zoom_out(),
-                        KeyCode::Char('w') => app.camera.pan(0.0, 1.0),
-                        KeyCode::Char('s') => app.camera.pan(0.0, -1.0),
-                        KeyCode::Char('a') => app.camera.pan(-1.0, 0.0),
-                        KeyCode::Char('d') => app.camera.pan(1.0, 0.0),
+                        // Every camera-moving key notes an interaction, which
+                        // drops FullHD to its reduced resolution until the view
+                        // settles again.
+                        KeyCode::Char('h') | KeyCode::Left => {
+                            app.camera.rotate_y(-1.0);
+                            app.note_camera_change();
+                        }
+                        KeyCode::Char('l') | KeyCode::Right => {
+                            app.camera.rotate_y(1.0);
+                            app.note_camera_change();
+                        }
+                        KeyCode::Char('j') | KeyCode::Down => {
+                            app.camera.rotate_x(1.0);
+                            app.note_camera_change();
+                        }
+                        KeyCode::Char('k') | KeyCode::Up => {
+                            app.camera.rotate_x(-1.0);
+                            app.note_camera_change();
+                        }
+                        KeyCode::Char('u') => {
+                            app.camera.rotate_z(-1.0);
+                            app.note_camera_change();
+                        }
+                        KeyCode::Char('i') => {
+                            app.camera.rotate_z(1.0);
+                            app.note_camera_change();
+                        }
+                        KeyCode::Char('+') | KeyCode::Char('=') => {
+                            app.camera.zoom_in();
+                            app.note_camera_change();
+                        }
+                        KeyCode::Char('-') => {
+                            app.camera.zoom_out();
+                            app.note_camera_change();
+                        }
+                        KeyCode::Char('w') => {
+                            app.camera.pan(0.0, 1.0);
+                            app.note_camera_change();
+                        }
+                        KeyCode::Char('s') => {
+                            app.camera.pan(0.0, -1.0);
+                            app.note_camera_change();
+                        }
+                        KeyCode::Char('a') => {
+                            app.camera.pan(-1.0, 0.0);
+                            app.note_camera_change();
+                        }
+                        KeyCode::Char('d') => {
+                            app.camera.pan(1.0, 0.0);
+                            app.note_camera_change();
+                        }
                         KeyCode::Char('r') => {
                             let (cols, rows) =
                                 crossterm::terminal::size().unwrap_or((term_cols, term_rows));
                             app.camera.reset();
                             app.recalculate_zoom(cols, rows);
+                            app.note_camera_change();
                         }
                         KeyCode::Char('c') => app.cycle_color(),
                         KeyCode::Char('v') => app.cycle_viz_mode(),
@@ -482,13 +553,16 @@ fn main() -> Result<()> {
         // Only rebuild when in Cartoon mode — Backbone/Wireframe don't use the
         // ribbon mesh, so skipping this preserves the lazy-mesh optimization for
         // large structures that start in a non-Cartoon mode.
+        let mesh_was_rebuilt = app.viz_mode == VizMode::Cartoon && app.mesh_is_dirty();
         if app.viz_mode == VizMode::Cartoon {
             app.ribbon_mesh();
         }
 
         // Always poll the background interface thread, even during skipped
         // frames, so the result is absorbed as soon as it's available.
+        let interface_was_pending = app.interface_pending();
         app.poll_background_interface();
+        let interface_absorbed = interface_was_pending && !app.interface_pending();
 
         // Adaptive frame skipping: if the previous draw took longer than the
         // tick rate, skip frames proportionally.  User input always forces a
@@ -503,6 +577,32 @@ fn main() -> Result<()> {
             // Reset the camera's tick timer so the next real tick doesn't see
             // a huge accumulated dt from the skipped frames.
             app.camera.reset_tick_timer();
+            std::thread::sleep(tick_rate);
+            continue;
+        }
+
+        // Nothing on screen changes unless input arrived, an animation is
+        // running, or background state was just absorbed.  Redrawing anyway
+        // would re-run the whole rasterize + transmit pipeline at every tick,
+        // forever, for an image identical to the one already on screen.
+        //
+        // The one extra case is `settled`: FullHD renders at a reduced
+        // resolution while the camera moves, so the frame after it comes to
+        // rest must be drawn to replace it with the sharp one.
+        let interacting = app.is_interacting();
+        let settled = was_interacting && !interacting;
+        was_interacting = interacting;
+
+        let must_redraw = had_input
+            || interacting
+            || settled
+            || app.ssh_hd_warning
+            || app.needs_clear
+            || mesh_was_rebuilt
+            || interface_absorbed
+            || frame_count < 2;
+        if !must_redraw {
+            app.tick();
             std::thread::sleep(tick_rate);
             continue;
         }
@@ -529,6 +629,9 @@ fn main() -> Result<()> {
             // a previous FullHD session.  Harmless no-op if there are none.
             let cleanup = render::kitty_png::KittyPngImage::cleanup_escape();
             execute!(terminal.backend_mut(), crossterm::style::Print(&cleanup))?;
+            // Drop any shared memory object the terminal never got round to
+            // reading, so switching modes cannot leave objects behind.
+            render::kitty_shm::unlink_all();
             terminal.clear()?;
             app.needs_clear = false;
         }
@@ -607,6 +710,7 @@ fn main() -> Result<()> {
     quit_flag.store(true, Ordering::Relaxed);
 
     // Restore terminal
+    render::kitty_shm::unlink_all();
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
