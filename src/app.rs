@@ -189,7 +189,7 @@ pub struct App {
     pub render_mode: RenderMode,
     pub show_help: bool,
     pub show_ligands: bool,
-    /// Whether a palette-colored screen-space silhouette is drawn.
+    /// Whether palette-colored screen-space structure edges are drawn.
     pub show_outline: bool,
     pub show_interface: bool,
     pub show_interactions: bool,

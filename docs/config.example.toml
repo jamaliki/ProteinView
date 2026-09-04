@@ -156,8 +156,8 @@ rainbow = "FF00FF"  # ligands under the Rainbow scheme
 # color = "1A1B26"
 
 # --- Traced outline ('o') ---------------------------------------------------
-# Screen-space silhouette color. The pale default is visible on dark terminal
-# backgrounds; use a dark ink such as "111111" with a light background.
+# Color for exterior, overlap, and structural-region edges. The pale default is
+# visible on dark terminals; use a dark ink with a light background.
 [outline]
 color = "D8DEE9"
 
@@ -213,7 +213,7 @@ color          = "structure"  # structure | chain | element | bfactor | rainbow 
 ball_and_stick = true         # picked residues as ball-and-stick rather than a marker ('b')
 ligands        = true         # draw ligands and ions ('g')
 auto_rotate    = false        # spin the structure on startup (space)
-outline        = false        # trace the structure silhouette on startup ('o')
+outline        = false        # trace structure and overlap edges on startup ('o')
 
 # Which named palette to open on. "default" is the colors written above; any
 # other name has to match a [[palette]] below, or ProteinView refuses to start

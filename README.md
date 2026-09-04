@@ -37,7 +37,7 @@ Terminal molecular structure viewer — load, rotate, and explore proteins, nucl
 - **Sequence panel** — scroll every chain's sequence, select residues, and show them as ball-and-stick in the 3D view
 - **7 color schemes** — structure, chain, element (CPK), B-factor, rainbow, pLDDT (AlphaFold)
 - **Interactive controls** — vim-style rotation, zoom, pan with auto-rotation
-- **Traced outlines** — optional palette-colored silhouettes across Braille, HD, HDplus, and FullHD
+- **Traced outlines** — optional palette-colored structure edges across Braille, HD, HDplus, and FullHD
 - **PDB & mmCIF** — both formats supported, with RCSB PDB fetch (`--fetch`)
 - **Directory browser** — open a folder, choose structures from a persistent file panel, and keep FullHD interactive
 - **Headless FullHD export** — render a pixel-perfect PNG for agents and scripts without starting a nested TUI
@@ -161,7 +161,7 @@ proteinview examples/4HHB.pdb --hd
 # FullHD pixel mode (Kitty/Sixel terminals)
 proteinview examples/4HHB.pdb --fullhd
 
-# Add a traced silhouette (also toggle it interactively with o)
+# Trace structure and overlap edges (also toggle interactively with o)
 proteinview examples/4HHB.pdb --fullhd --outline
 
 # Headless FullHD pixel snapshot (no alternate screen or terminal probing)
@@ -371,10 +371,11 @@ with or without a leading `#`, in either case. Element symbols merge onto the
 built-in CPK table, so overriding carbon leaves the rest alone, while
 `[chain] colors` replaces the chain cycle outright.
 
-Outline mode traces an exterior screen-space silhouette in every interactive
-render tier. Press `o`, pass `--outline`, or set `[defaults] outline = true`.
-Its color belongs to the active palette and defaults to a pale neutral that is
-visible on dark terminals:
+Outline mode traces both the exterior and internal screen-space boundaries
+between overlapping or differently colored structural regions in every render
+tier. Press `o`, pass `--outline`, or set `[defaults] outline = true`. Its color
+belongs to the active palette and defaults to a pale neutral that is visible on
+dark terminals:
 
 ```toml
 [outline]

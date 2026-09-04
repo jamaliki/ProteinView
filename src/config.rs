@@ -264,7 +264,7 @@ impl Default for SelectionPalette {
     }
 }
 
-/// Screen-space silhouette color used by outline mode.
+/// Screen-space structure-edge color used by outline mode.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct OutlinePalette {
@@ -401,7 +401,7 @@ pub struct Defaults {
     pub ligands: Option<bool>,
     /// Spin the structure when nothing else is driving the camera.
     pub auto_rotate: Option<bool>,
-    /// Trace a screen-space silhouette around rendered structures.
+    /// Trace screen-space exterior, overlap, and material boundaries.
     pub outline: Option<bool>,
 }
 

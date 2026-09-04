@@ -63,6 +63,24 @@ fn blend_fog(c: &mut [u8; 3], fog_color: [u8; 3], blend: f32, desaturation: f32)
     }
 }
 
+/// Manhattan distance between normalized RGB chromaticities. Pure brightness
+/// changes have distance zero, while distinct material hues approach two.
+fn chroma_distance(a: [u8; 3], b: [u8; 3]) -> f32 {
+    let a_sum = f32::from(a[0]) + f32::from(a[1]) + f32::from(a[2]);
+    let b_sum = f32::from(b[0]) + f32::from(b[1]) + f32::from(b[2]);
+    if a_sum == 0.0 || b_sum == 0.0 {
+        return if a == b { 0.0 } else { 2.0 };
+    }
+    a.iter()
+        .zip(b.iter())
+        .map(|(&left, &right)| (f32::from(left) / a_sum - f32::from(right) / b_sum).abs())
+        .sum()
+}
+
+fn rgb_key(color: [u8; 3]) -> u32 {
+    (u32::from(color[0]) << 16) | (u32::from(color[1]) << 8) | u32::from(color[2])
+}
+
 /// RGB pixel framebuffer with z-buffer for software rasterization.
 ///
 /// Pixel coordinates: (0,0) is top-left, x increases right, y increases down.
@@ -345,12 +363,14 @@ impl Framebuffer {
             });
     }
 
-    /// Trace an exterior screen-space silhouette around all rendered pixels.
+    /// Trace screen-space structure edges around and within rendered geometry.
     ///
-    /// The original depth mask is expanded by `radius` pixels and only the new
-    /// exterior ring is colored, so the pass never replaces molecular color.
-    /// A finite sentinel depth marks the ring as rendered while keeping it
-    /// behind every real geometry sample during braille color selection.
+    /// The original depth mask is expanded by `radius` pixels for the exterior
+    /// ring. Internal contours are added on the farther side of occlusion depth
+    /// jumps and on one side of abrupt chroma changes, separating overlapping
+    /// structures and differently colored regions without double-width lines.
+    /// A finite sentinel depth marks the exterior ring as rendered while
+    /// keeping it behind real geometry during braille color selection.
     pub fn apply_outline(&mut self, color: [u8; 3], radius: usize) {
         if radius == 0 {
             return;
@@ -364,6 +384,46 @@ impl Framebuffer {
         if !original.iter().any(|occupied| *occupied != 0) {
             return;
         }
+
+        // Detect internal structure boundaries before expanding the mask.
+        // Color is compared as chromaticity, making the test insensitive to
+        // Lambert brightness changes across one material. Depth contours are
+        // drawn on the farther surface, like an ink line at an occlusion.
+        const DEPTH_EDGE_THRESHOLD: f32 = 0.8;
+        let internal_edges: Vec<u8> = (0..self.depth.len())
+            .into_par_iter()
+            .map(|index| {
+                if original[index] == 0 {
+                    return 0;
+                }
+                let x = index % self.width;
+                let y = index / self.width;
+                let y0 = y.saturating_sub(1);
+                let y1 = (y + 1).min(self.height - 1);
+                let x0 = x.saturating_sub(1);
+                let x1 = (x + 1).min(self.width - 1);
+                let depth = self.depth[index];
+                let pixel = self.color[index];
+                for near_y in y0..=y1 {
+                    for near_x in x0..=x1 {
+                        let near_index = near_y * self.width + near_x;
+                        if original[near_index] == 0 || near_index == index {
+                            continue;
+                        }
+                        if self.depth[near_index] + DEPTH_EDGE_THRESHOLD < depth {
+                            return 1;
+                        }
+                        let near_pixel = self.color[near_index];
+                        if chroma_distance(pixel, near_pixel) > 0.45
+                            && rgb_key(pixel) < rgb_key(near_pixel)
+                        {
+                            return 1;
+                        }
+                    }
+                }
+                0
+            })
+            .collect();
 
         let mut expanded = original.clone();
         for _ in 0..radius {
@@ -393,13 +453,22 @@ impl Framebuffer {
         self.color
             .par_iter_mut()
             .zip(self.depth.par_iter_mut())
-            .zip(original.par_iter().zip(expanded.par_iter()))
-            .for_each(|((pixel, depth), (&was_occupied, &is_occupied))| {
-                if was_occupied == 0 && is_occupied != 0 {
-                    *pixel = color;
-                    *depth = f32::MAX;
-                }
-            });
+            .zip(
+                original
+                    .par_iter()
+                    .zip(expanded.par_iter())
+                    .zip(internal_edges.par_iter()),
+            )
+            .for_each(
+                |((pixel, depth), ((&was_occupied, &is_occupied), &internal_edge))| {
+                    if internal_edge != 0 {
+                        *pixel = color;
+                    } else if was_occupied == 0 && is_occupied != 0 {
+                        *pixel = color;
+                        *depth = f32::MAX;
+                    }
+                },
+            );
     }
 
     /// Cohen-Sutherland line clipping against framebuffer bounds [0, width) x [0, height).
@@ -1506,6 +1575,49 @@ mod tests {
         assert_eq!(fb.color[3 * 7 + 3], [200, 100, 50]);
         assert_eq!(fb.color[1 * 7 + 1], [8, 9, 10]);
         assert!(fb.depth[0].is_infinite());
+    }
+
+    #[test]
+    fn outline_traces_an_internal_occlusion_boundary() {
+        let mut fb = Framebuffer::new(8, 3);
+        for y in 0..3 {
+            for x in 0..8 {
+                let depth = if x < 4 { 1.0 } else { 4.0 };
+                fb.set_pixel(x, y, depth, [120, 80, 40]);
+            }
+        }
+        fb.apply_outline([1, 2, 3], 1);
+
+        assert_eq!(fb.color[4], [1, 2, 3], "far side should carry the ink");
+        assert_eq!(
+            fb.color[3],
+            [120, 80, 40],
+            "near side should remain visible"
+        );
+        assert_eq!(
+            fb.color[7],
+            [120, 80, 40],
+            "flat interior should stay unchanged"
+        );
+    }
+
+    #[test]
+    fn outline_traces_material_changes_but_not_brightness_changes() {
+        let mut materials = Framebuffer::new(8, 3);
+        let mut shading = Framebuffer::new(8, 3);
+        for y in 0..3 {
+            for x in 0..8 {
+                let material = if x < 4 { [220, 20, 80] } else { [230, 190, 10] };
+                let shade = if x < 4 { [200, 100, 50] } else { [100, 50, 25] };
+                materials.set_pixel(x, y, 1.0, material);
+                shading.set_pixel(x, y, 1.0, shade);
+            }
+        }
+        materials.apply_outline([1, 2, 3], 1);
+        shading.apply_outline([1, 2, 3], 1);
+
+        assert!(materials.color.iter().any(|pixel| *pixel == [1, 2, 3]));
+        assert!(!shading.color.iter().any(|pixel| *pixel == [1, 2, 3]));
     }
 
     #[test]
