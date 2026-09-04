@@ -70,18 +70,6 @@ impl ColorSchemeType {
             Self::Interface => Self::Structure,
         }
     }
-
-    pub fn name(&self) -> &str {
-        match self {
-            Self::Structure => "Structure",
-            Self::Chain => "Chain",
-            Self::Element => "Element",
-            Self::BFactor => "B-Factor",
-            Self::Rainbow => "Rainbow",
-            Self::Interface => "Interface",
-            Self::Plddt => "pLDDT",
-        }
-    }
 }
 
 /// Color scheme for rendering

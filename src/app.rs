@@ -110,14 +110,6 @@ impl VizMode {
             Self::Wireframe => Self::Backbone,
         }
     }
-
-    pub fn name(&self) -> &str {
-        match self {
-            Self::Backbone => "Backbone",
-            Self::Cartoon => "Cartoon",
-            Self::Wireframe => "Wireframe",
-        }
-    }
 }
 
 /// Rendering mode for the 3D viewport
@@ -146,15 +138,6 @@ impl RenderMode {
             "hdplus" | "hd+" | "halfblockplus" | "half-block-plus" => Some(Self::HalfBlockPlus),
             "fullhd" | "pixel" | "full-hd" => Some(Self::FullHD),
             _ => None,
-        }
-    }
-
-    pub fn name(&self) -> &str {
-        match self {
-            Self::Braille => "Braille",
-            Self::HalfBlock => "HD",
-            Self::HalfBlockPlus => "HDplus",
-            Self::FullHD => "FullHD",
         }
     }
 }
@@ -434,6 +417,49 @@ impl App {
             seq_panel_height: DEFAULT_SEQUENCE_PANEL_HEIGHT,
             seq_pending_goto: None,
         }
+    }
+
+    /// Replace the displayed structure without leaving the TUI.
+    ///
+    /// Presentation preferences survive file changes, while all state derived
+    /// from a particular protein (camera, interfaces, mesh, sequence cursor,
+    /// and selections) is rebuilt together by `new`.
+    pub fn replace_protein(
+        &mut self,
+        protein: Protein,
+        residue_colors: ResidueColorOverrides,
+        term_cols: u16,
+        term_rows: u16,
+    ) {
+        let color_override = if self.show_interface {
+            Some(self.saved_color_scheme_type)
+        } else {
+            Some(self.color_scheme.scheme_type)
+        };
+        let auto_rotate = self.camera.auto_rotate;
+        let show_ligands = self.show_ligands;
+        let show_ball_stick = self.show_ball_stick;
+        let kitty_shm = self.kitty_shm;
+
+        let mut replacement = Self::new(
+            protein,
+            AppConfig {
+                render_mode: self.render_mode,
+                viz_mode: self.viz_mode,
+                user_explicit_mode: true,
+                color_override,
+                residue_colors,
+            },
+            term_cols,
+            term_rows,
+            self.picker.clone(),
+        );
+        replacement.camera.auto_rotate = auto_rotate;
+        replacement.show_ligands = show_ligands;
+        replacement.show_ball_stick = show_ball_stick;
+        replacement.kitty_shm = kitty_shm;
+        replacement.needs_clear = true;
+        *self = replacement;
     }
 
     pub fn cycle_color(&mut self) {

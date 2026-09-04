@@ -1,4 +1,5 @@
 mod app;
+mod browser;
 mod config;
 mod event;
 mod model;
@@ -7,7 +8,7 @@ mod parser;
 mod render;
 mod ui;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use crossterm::{
     event::KeyCode,
@@ -17,11 +18,12 @@ use crossterm::{
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::prelude::*;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use app::{App, AppConfig, ConnectionType, RenderMode, VizMode};
+use browser::FileBrowser;
 use model::selection::{ResidueColorSpec, resolve_residue_colors};
 
 macro_rules! log {
@@ -38,7 +40,7 @@ macro_rules! log {
 #[derive(Parser)]
 #[command(name = "proteinview", version, about = "TUI protein structure viewer")]
 struct Cli {
-    /// Path to PDB, mmCIF, or XYZ file
+    /// Path to a PDB, mmCIF, or XYZ file, or a directory to browse
     file: Option<String>,
 
     /// Use HD rendering (HalfBlock over SSH, FullHD locally)
@@ -143,18 +145,43 @@ struct Cli {
 ///
 /// Cheap unless the width actually changed, so it is called both before and
 /// after input handling.
-fn sync_sequence_viewport(app: &mut App, fallback: (u16, u16)) {
+fn viewport_width(term_cols: u16, browser: Option<&FileBrowser>, show_interface: bool) -> u16 {
+    let file_panel_width = browser.map_or(0, |browser| {
+        browser::panel_width(term_cols, browser.visible)
+    });
+    term_cols
+        .saturating_sub(file_panel_width)
+        .saturating_sub(if show_interface {
+            ui::interface_panel::SIDEBAR_WIDTH
+        } else {
+            0
+        })
+        .max(1)
+}
+
+fn sync_sequence_viewport(app: &mut App, browser: Option<&FileBrowser>, fallback: (u16, u16)) {
     if !app.show_sequence {
         return;
     }
     let (cols, rows) = crossterm::terminal::size().unwrap_or(fallback);
-    let panel_width = if app.show_interface {
-        cols.saturating_sub(ui::interface_panel::SIDEBAR_WIDTH)
-    } else {
-        cols
-    };
+    let panel_width = viewport_width(cols, browser, app.show_interface);
     let panel_height = ui::sequence_panel::height_for(app, rows);
     app.set_sequence_viewport(panel_width, panel_height);
+}
+
+fn load_structure_file(file: &Path) -> Result<model::protein::Protein> {
+    let file_str = file
+        .to_str()
+        .with_context(|| format!("structure path is not valid UTF-8: '{}'", file.display()))?;
+    if file
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("xyz"))
+    {
+        parser::xyz::load_xyz(file_str)
+    } else {
+        parser::pdb::load_structure(file_str)
+    }
 }
 
 /// Keys the sequence panel owns while it is open.
@@ -230,35 +257,44 @@ fn main() -> Result<()> {
         Err(e) => eprintln!("Warning: failed to initialize rayon thread pool: {e}"),
     }
 
-    // Determine the file path. Fetched structures are temporary inputs and are
-    // removed immediately after parsing, including when parsing fails.
+    // Resolve either one structure or a directory-backed interactive browser.
+    // Fetched structures are temporary inputs and are removed immediately
+    // after parsing, including when parsing fails.
     let fetched_path = cli
         .fetch
         .as_deref()
         .map(parser::fetch::fetch_pdb)
         .transpose()?;
-    let file_path = if let Some(path) = fetched_path.as_ref() {
-        path.clone()
-    } else if let Some(path) = &cli.file {
-        path.clone()
+    let (file_path, mut browser) = if let Some(file) = fetched_path.as_ref() {
+        (PathBuf::from(file), None)
+    } else if let Some(file) = &cli.file {
+        let requested = PathBuf::from(file);
+        if requested.is_dir() {
+            if cli.panel_server || cli.snapshot.is_some() {
+                anyhow::bail!("directory input is only available in the interactive TUI");
+            }
+            let browser = FileBrowser::open_directory(&requested)?;
+            (browser.selected_path().to_path_buf(), Some(browser))
+        } else {
+            let browser = FileBrowser::alongside_file(&requested)?;
+            (requested, Some(browser))
+        }
     } else {
         eprintln!("Error: provide a file path or use --fetch <PDB_ID>");
         std::process::exit(1);
     };
 
     // Load protein structure (dispatch by file extension)
-    let lower = file_path.to_lowercase();
-    let is_xyz = lower.ends_with(".xyz");
-    let protein_result = if is_xyz {
-        parser::xyz::load_xyz(&file_path)
-    } else {
-        parser::pdb::load_structure(&file_path)
-    };
-    if let Some(path) = fetched_path {
-        if let Err(error) = std::fs::remove_file(&path) {
+    let is_xyz = file_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("xyz"));
+    let protein_result = load_structure_file(&file_path);
+    if let Some(file) = fetched_path {
+        if let Err(error) = std::fs::remove_file(&file) {
             eprintln!(
                 "Warning: failed to remove temporary fetched structure '{}': {error}",
-                path
+                file
             );
         }
     }
@@ -454,7 +490,9 @@ fn main() -> Result<()> {
         && render::kitty_shm::probe(Duration::from_millis(500));
     log!(logfile, "kitty shared-memory transport: {}", kitty_shm);
 
-    // Create app with actual terminal dimensions for dynamic zoom
+    // Create the app against the actual 3D viewport, excluding a browser that
+    // starts open for directory input.
+    let initial_viewport_cols = viewport_width(term_cols, browser.as_ref(), false);
     let mut app = App::new(
         protein,
         AppConfig {
@@ -464,7 +502,7 @@ fn main() -> Result<()> {
             color_override,
             residue_colors,
         },
-        term_cols,
+        initial_viewport_cols,
         term_rows,
         picker,
     );
@@ -495,7 +533,7 @@ fn main() -> Result<()> {
     loop {
         // Cursor movement is expressed in layout rows, so the layout has to be
         // current before keys are handled.
-        sync_sequence_viewport(&mut app, (term_cols, term_rows));
+        sync_sequence_viewport(&mut app, browser.as_ref(), (term_cols, term_rows));
 
         // Drain all queued input from the dedicated input thread
         let mut had_input = false;
@@ -504,11 +542,107 @@ fn main() -> Result<()> {
             match app_event {
                 event::AppEvent::Resize(cols, rows) => {
                     log!(logfile, "resize: {}x{}", cols, rows);
+                    let cols = viewport_width(cols, browser.as_ref(), app.show_interface);
                     app.recalculate_zoom(cols, rows);
                     app.mesh_dirty_flag();
                 }
                 event::AppEvent::Key(key) => {
                     log!(logfile, "key: {:?}", key.code);
+                    let ctrl_c = key.code == KeyCode::Char('c')
+                        && key
+                            .modifiers
+                            .contains(crossterm::event::KeyModifiers::CONTROL);
+                    if key.code == KeyCode::Char('q') || ctrl_c {
+                        app.should_quit = true;
+                        continue;
+                    }
+
+                    if key.code == KeyCode::Char('?') {
+                        app.show_help = !app.show_help;
+                        continue;
+                    }
+                    if key.code == KeyCode::Esc && app.show_help {
+                        app.show_help = false;
+                        continue;
+                    }
+
+                    if key.code == KeyCode::Char('e') {
+                        if let Some(file_browser) = browser.as_mut() {
+                            file_browser.toggle();
+                            let (cols, rows) =
+                                crossterm::terminal::size().unwrap_or((term_cols, term_rows));
+                            let cols = viewport_width(cols, browser.as_ref(), app.show_interface);
+                            app.recalculate_zoom(cols, rows);
+                            app.needs_clear = true;
+                        }
+                        continue;
+                    }
+
+                    if key.code == KeyCode::Tab || key.code == KeyCode::BackTab {
+                        if let Some(file_browser) = browser.as_mut() {
+                            file_browser.toggle_focus();
+                        }
+                        continue;
+                    }
+
+                    if browser.as_ref().is_some_and(|browser| browser.focused) {
+                        let file_browser = browser.as_mut().expect("browser focus implies browser");
+                        match key.code {
+                            KeyCode::Char('j') | KeyCode::Down => file_browser.move_selection(1),
+                            KeyCode::Char('k') | KeyCode::Up => file_browser.move_selection(-1),
+                            KeyCode::PageDown => {
+                                file_browser.page(1, usize::from(term_rows.saturating_sub(4)))
+                            }
+                            KeyCode::PageUp => {
+                                file_browser.page(-1, usize::from(term_rows.saturating_sub(4)))
+                            }
+                            KeyCode::Home => file_browser.select_first(),
+                            KeyCode::End => file_browser.select_last(),
+                            KeyCode::Enter => {
+                                let selected = file_browser.selected_path().to_path_buf();
+                                if selected == file_browser.current {
+                                    file_browser.focused = false;
+                                    continue;
+                                }
+                                match load_structure_file(&selected).and_then(|protein| {
+                                    let residue_colors =
+                                        resolve_residue_colors(&protein, &cli.residue_color)?;
+                                    Ok((protein, residue_colors))
+                                }) {
+                                    Ok((protein, residue_colors)) => {
+                                        let (cols, rows) = crossterm::terminal::size()
+                                            .unwrap_or((term_cols, term_rows));
+                                        let cols = cols
+                                            .saturating_sub(browser::panel_width(
+                                                cols,
+                                                file_browser.visible,
+                                            ))
+                                            .saturating_sub(if app.show_interface {
+                                                ui::interface_panel::SIDEBAR_WIDTH
+                                            } else {
+                                                0
+                                            })
+                                            .max(1);
+                                        app.replace_protein(protein, residue_colors, cols, rows);
+                                        file_browser.mark_loaded(&selected);
+                                        file_browser.focused = false;
+                                        frames_to_skip = 0;
+                                        was_interacting = false;
+                                        log!(
+                                            logfile,
+                                            "loaded from browser: {}",
+                                            selected.display()
+                                        );
+                                    }
+                                    Err(error) => file_browser.set_error(format!("{error:#}")),
+                                }
+                            }
+                            KeyCode::Esc => file_browser.focused = false,
+                            _ => {}
+                        }
+                        continue;
+                    }
+
                     // While the panel is open it owns the arrow keys and the
                     // selection keys; h/j/k/l keep driving the camera, so the
                     // view stays steerable with the sequence in front of you.
@@ -578,6 +712,7 @@ fn main() -> Result<()> {
                         KeyCode::Char('r') => {
                             let (cols, rows) =
                                 crossterm::terminal::size().unwrap_or((term_cols, term_rows));
+                            let cols = viewport_width(cols, browser.as_ref(), app.show_interface);
                             app.camera.reset();
                             app.recalculate_zoom(cols, rows);
                             app.note_camera_change();
@@ -595,20 +730,28 @@ fn main() -> Result<()> {
                         KeyCode::Char('m') => {
                             let (cols, rows) =
                                 crossterm::terminal::size().unwrap_or((term_cols, term_rows));
+                            let cols = viewport_width(cols, browser.as_ref(), app.show_interface);
                             app.toggle_hd(cols, rows);
                         }
                         KeyCode::Char('M') => {
                             let (cols, rows) =
                                 crossterm::terminal::size().unwrap_or((term_cols, term_rows));
+                            let cols = viewport_width(cols, browser.as_ref(), app.show_interface);
                             app.toggle_fullhd(cols, rows);
                         }
                         KeyCode::Char('[') => app.prev_chain(),
                         KeyCode::Char(']') => app.next_chain(),
                         KeyCode::Char(' ') => app.camera.auto_rotate = !app.camera.auto_rotate,
-                        KeyCode::Char('f') => app.toggle_interface(),
+                        KeyCode::Char('f') => {
+                            app.toggle_interface();
+                            let (cols, rows) =
+                                crossterm::terminal::size().unwrap_or((term_cols, term_rows));
+                            let cols = viewport_width(cols, browser.as_ref(), app.show_interface);
+                            app.recalculate_zoom(cols, rows);
+                            app.needs_clear = true;
+                        }
                         KeyCode::Char('I') => app.toggle_interactions(),
                         KeyCode::Char('g') => app.toggle_ligands(),
-                        KeyCode::Char('?') => app.show_help = !app.show_help,
                         KeyCode::Char('S') => app.toggle_sequence_panel(),
                         KeyCode::Char('b') => app.toggle_ball_stick(),
                         KeyCode::Char('z') => {
@@ -722,10 +865,28 @@ fn main() -> Result<()> {
         // ...and again after input, because the key that opened the panel or
         // resized it arrived after the first sync: the frame about to be drawn
         // must not be the one frame with a stale layout.
-        sync_sequence_viewport(&mut app, (term_cols, term_rows));
+        sync_sequence_viewport(&mut app, browser.as_ref(), (term_cols, term_rows));
 
         let draw_start = Instant::now();
         terminal.draw(|frame| {
+            let file_panel_width = browser.as_ref().map_or(0, |file_browser| {
+                browser::panel_width(frame.area().width, file_browser.visible)
+            });
+            let protein_area = if file_panel_width > 0 {
+                let horizontal = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Length(file_panel_width), Constraint::Min(20)])
+                    .split(frame.area());
+                ui::file_browser::render_file_browser(
+                    frame,
+                    horizontal[0],
+                    browser.as_ref().expect("visible panel implies browser"),
+                );
+                horizontal[1]
+            } else {
+                frame.area()
+            };
+
             // If interface is active, split horizontally: sidebar | main
             let main_area = if app.show_interface {
                 let horiz = Layout::default()
@@ -734,7 +895,7 @@ fn main() -> Result<()> {
                         Constraint::Length(ui::interface_panel::SIDEBAR_WIDTH),
                         Constraint::Min(20),
                     ])
-                    .split(frame.area());
+                    .split(protein_area);
 
                 let summary = app.interface_analysis.summary(&app.protein);
                 let chain_names = app.chain_names();
@@ -750,7 +911,7 @@ fn main() -> Result<()> {
                 );
                 horiz[1]
             } else {
-                frame.area()
+                protein_area
             };
 
             let sequence_height = ui::sequence_panel::height_for(&app, main_area.height);
@@ -760,8 +921,7 @@ fn main() -> Result<()> {
                     Constraint::Length(1),               // Header
                     Constraint::Min(3),                  // Viewport
                     Constraint::Length(sequence_height), // Sequence panel
-                    Constraint::Length(2),               // Status bar
-                    Constraint::Length(1),               // Help bar
+                    Constraint::Length(1),               // Mode and key hints
                 ])
                 .split(main_area);
 
@@ -770,8 +930,7 @@ fn main() -> Result<()> {
             if sequence_height > 0 {
                 ui::sequence_panel::render_sequence_panel(frame, chunks[2], &app);
             }
-            ui::statusbar::render_statusbar(frame, chunks[3], &app);
-            ui::helpbar::render_helpbar(frame, chunks[4], &app);
+            ui::statusbar::render_statusbar(frame, chunks[3], browser.as_ref());
 
             if app.show_help {
                 ui::help_overlay::render_help_overlay(frame, frame.area());

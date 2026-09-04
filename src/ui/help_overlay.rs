@@ -11,7 +11,7 @@ pub fn render_help_overlay(frame: &mut Frame, area: Rect) {
         return;
     }
     let popup_width = 60u16.min(area.width.saturating_sub(4));
-    let popup_height = 36u16.min(area.height.saturating_sub(4));
+    let popup_height = 46u16.min(area.height.saturating_sub(4));
     let x = (area.width - popup_width) / 2;
     let y = (area.height - popup_height) / 2;
     let popup_area = Rect::new(x, y, popup_width, popup_height);
@@ -91,12 +91,39 @@ pub fn render_help_overlay(frame: &mut Frame, area: Rect) {
             Span::raw("Toggle auto-rotation"),
         ]),
         Line::from(vec![
+            Span::styled("  e          ", Style::default().fg(Color::Yellow)),
+            Span::raw("Show / hide the file browser"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Tab        ", Style::default().fg(Color::Yellow)),
+            Span::raw("Focus file browser / 3D viewer"),
+        ]),
+        Line::from(vec![
             Span::styled("  ?          ", Style::default().fg(Color::Yellow)),
             Span::raw("Toggle this help"),
         ]),
         Line::from(vec![
             Span::styled("  q          ", Style::default().fg(Color::Yellow)),
             Span::raw("Quit"),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  File editor",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(vec![
+            Span::styled("  j/k, arrows", Style::default().fg(Color::Yellow)),
+            Span::raw(" Move through structure files"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Enter      ", Style::default().fg(Color::Yellow)),
+            Span::raw("Open file and focus ProteinView"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Tab / Esc  ", Style::default().fg(Color::Yellow)),
+            Span::raw("Return focus to ProteinView"),
         ]),
         Line::from(""),
         Line::from(Span::styled(

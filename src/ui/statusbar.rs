@@ -1,158 +1,144 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::app::{App, ConnectionType, RenderMode, VizMode};
-use crate::config::palette;
+use crate::browser::FileBrowser;
 
-/// Render the status bar showing current mode and info
-pub fn render_statusbar(frame: &mut Frame, area: Rect, app: &App) {
-    let chain_info = if let Some(chain) = app.protein.chains.get(app.current_chain) {
-        format!("Chain {} ", chain.id)
+#[derive(Clone, Copy)]
+enum InputMode {
+    Editor,
+    ProteinView,
+}
+
+/// Render one compact, focus-aware mode line.
+///
+/// The complete binding list belongs in `?` help. This line adds hints only
+/// while they fit, so opening the file browser never produces clipped text.
+pub fn render_statusbar(frame: &mut Frame, area: Rect, browser: Option<&FileBrowser>) {
+    let mode = if browser.is_some_and(|browser| browser.focused) {
+        InputMode::Editor
     } else {
-        "No chains ".to_string()
+        InputMode::ProteinView
     };
-
-    let res_count = app.protein.residue_count();
-    let render_mode_name = app.render_mode.name();
-
-    let border_fill = (area.width as usize).saturating_sub(2);
-    let status = Paragraph::new(Line::from(vec![
-        Span::styled("\u{251c}", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            "\u{2500}".repeat(border_fill),
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::styled("\u{2524}", Style::default().fg(Color::DarkGray)),
-    ]));
-    frame.render_widget(status, area);
-
-    // Render the actual status info on the next line if area has height > 1
-    if area.height > 1 {
-        let info_area = Rect::new(area.x, area.y + 1, area.width, 1);
-        // Build spans dynamically
-        let mut spans = vec![
-            Span::styled("\u{2502} ", Style::default().fg(Color::DarkGray)),
-            Span::styled(&chain_info, Style::default().fg(Color::Cyan)),
-            Span::styled("\u{2502} ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("{} res ", res_count),
-                Style::default().fg(Color::White),
-            ),
-        ];
-
-        if app.protein.ligand_count() > 0 {
+    let browser_available = browser.is_some();
+    let mut spans = vec![mode_span(mode)];
+    for (key, action) in fitting_hints(area.width, mode, browser_available) {
+        spans.push(Span::styled(
+            format!(" {key}"),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        if !action.is_empty() {
             spans.push(Span::styled(
-                "\u{2502} ",
-                Style::default().fg(Color::DarkGray),
-            ));
-            spans.push(Span::styled(
-                format!("{} ligands ", app.protein.ligand_count()),
-                Style::default().fg(Color::Rgb(255, 0, 255)),
+                format!(" {action}"),
+                Style::default().fg(Color::Gray),
             ));
         }
+    }
 
-        // In Braille mode, Cartoon is silently degraded to Backbone rendering
-        // (the basic braille renderer has no triangle mesh support).  Show this
-        // honestly so the user isn't confused.
-        let viz_label =
-            if app.render_mode == RenderMode::Braille && app.viz_mode == VizMode::Cartoon {
-                "Backbone*"
-            } else {
-                app.viz_mode.name()
-            };
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::Rgb(24, 24, 28))),
+        area,
+    );
+}
 
-        spans.extend_from_slice(&[
-            Span::styled("\u{2502} ", Style::default().fg(Color::DarkGray)),
-            Span::styled(viz_label, Style::default().fg(Color::Green)),
-            Span::styled(" \u{2502} ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                app.color_scheme.scheme_type.name(),
-                Style::default().fg(Color::Yellow),
-            ),
-            Span::styled(" \u{2502} ", Style::default().fg(Color::DarkGray)),
-            Span::styled(render_mode_name, Style::default().fg(Color::Magenta)),
-            Span::raw(" "),
-        ]);
+fn mode_span(mode: InputMode) -> Span<'static> {
+    let (label, color) = match mode {
+        InputMode::Editor => (" EDITOR ", Color::Yellow),
+        InputMode::ProteinView => (" PROTEINVIEW ", Color::Green),
+    };
+    Span::styled(
+        label,
+        Style::default()
+            .fg(Color::Black)
+            .bg(color)
+            .add_modifier(Modifier::BOLD),
+    )
+}
 
-        // Name the palette only when there is more than one to be in: with a
-        // plain config there is nothing to disambiguate and the bar is busy.
-        if crate::config::palette_count() > 1 {
-            spans.push(Span::styled(
-                "\u{2502} ",
-                Style::default().fg(Color::DarkGray),
-            ));
-            spans.push(Span::styled(
-                crate::config::palette_name(),
-                Style::default().fg(Color::Cyan),
-            ));
-            spans.push(Span::raw(" "));
+fn fitting_hints(
+    width: u16,
+    mode: InputMode,
+    browser_available: bool,
+) -> Vec<(&'static str, &'static str)> {
+    let mode_width = match mode {
+        InputMode::Editor => 8,
+        InputMode::ProteinView => 13,
+    };
+    let mut used = mode_width;
+    let mut result = Vec::new();
+    let candidates: &[(&str, &str)] = match mode {
+        InputMode::Editor => &[
+            ("j/k", "move"),
+            ("Enter", "open"),
+            ("Tab", "viewer"),
+            ("e", "hide"),
+            ("PgUp/Dn", "page"),
+        ],
+        InputMode::ProteinView if browser_available => &[
+            ("hjkl", "rotate"),
+            ("wasd", "pan"),
+            ("+/-", "zoom"),
+            ("Tab", "editor"),
+            ("e", "files"),
+        ],
+        InputMode::ProteinView => &[
+            ("hjkl", "rotate"),
+            ("wasd", "pan"),
+            ("+/-", "zoom"),
+            ("m/M", "quality"),
+        ],
+    };
+    let verbose_essential = [("?", "help"), ("q", "quit")];
+    let compact_essential = [("?", ""), ("q", "")];
+    let essential = if mode_width + hints_width(&verbose_essential) <= usize::from(width) {
+        &verbose_essential
+    } else {
+        &compact_essential
+    };
+    let essential_width = hints_width(essential);
+
+    for &(key, action) in candidates {
+        let hint_width = hint_width(key, action);
+        if used + hint_width + essential_width > usize::from(width) {
+            break;
         }
+        result.push((key, action));
+        used += hint_width;
+    }
+    result.extend(essential.iter().copied());
+    result
+}
 
-        // Show SSH indicator
-        if app.connection_type == ConnectionType::Ssh {
-            spans.push(Span::styled(
-                "\u{2502} ",
-                Style::default().fg(Color::DarkGray),
-            ));
-            spans.push(Span::styled(
-                "SSH",
-                Style::default().fg(Color::Rgb(255, 165, 0)),
-            ));
-            spans.push(Span::raw(" "));
+fn hints_width(hints: &[(&str, &str)]) -> usize {
+    hints
+        .iter()
+        .map(|(key, action)| hint_width(key, action))
+        .sum()
+}
+
+fn hint_width(key: &str, action: &str) -> usize {
+    1 + key.len() + usize::from(!action.is_empty()) * (1 + action.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hints_never_exceed_the_available_width() {
+        for width in 17..=160 {
+            for mode in [InputMode::Editor, InputMode::ProteinView] {
+                let mode_width = match mode {
+                    InputMode::Editor => 8,
+                    InputMode::ProteinView => 13,
+                };
+                let hints = fitting_hints(width, mode, true);
+                assert!(mode_width + hints_width(&hints) <= usize::from(width));
+            }
         }
-
-        // Show SSH HD warning
-        if app.ssh_hd_warning {
-            spans.push(Span::styled(
-                "\u{2502} ",
-                Style::default().fg(Color::DarkGray),
-            ));
-            spans.push(Span::styled(
-                "\u{26a0} Full HD over SSH may be slow",
-                Style::default().fg(Color::Rgb(255, 200, 0)),
-            ));
-            spans.push(Span::raw(" "));
-        }
-
-        // Show what the sequence panel has picked, so a selection made once is
-        // still accounted for after the panel is closed.
-        if !app.selection.is_empty() {
-            spans.push(Span::styled(
-                "\u{2502} ",
-                Style::default().fg(Color::DarkGray),
-            ));
-            let [red, green, blue] = palette().selection.marker.0;
-            spans.push(Span::styled(
-                format!("{} sel", app.selection.count()),
-                Style::default().fg(Color::Rgb(red, green, blue)),
-            ));
-            spans.push(Span::styled(
-                if app.show_ball_stick {
-                    " ball&stick "
-                } else {
-                    " marked "
-                },
-                Style::default().fg(Color::DarkGray),
-            ));
-        }
-
-        // Show interactions indicator
-        if app.show_interface && app.show_interactions {
-            spans.push(Span::styled(
-                "\u{2502} ",
-                Style::default().fg(Color::DarkGray),
-            ));
-            spans.push(Span::styled(
-                "Interactions",
-                Style::default().fg(Color::Cyan),
-            ));
-            spans.push(Span::raw(" "));
-        }
-
-        let info = Paragraph::new(Line::from(spans));
-        frame.render_widget(info, info_area);
     }
 }

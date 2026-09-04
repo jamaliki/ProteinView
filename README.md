@@ -38,6 +38,7 @@ Terminal molecular structure viewer — load, rotate, and explore proteins, nucl
 - **7 color schemes** — structure, chain, element (CPK), B-factor, rainbow, pLDDT (AlphaFold)
 - **Interactive controls** — vim-style rotation, zoom, pan with auto-rotation
 - **PDB & mmCIF** — both formats supported, with RCSB PDB fetch (`--fetch`)
+- **Directory browser** — open a folder, choose structures from a persistent file panel, and keep FullHD interactive
 - **Headless FullHD export** — render a pixel-perfect PNG for agents and scripts without starting a nested TUI
 - **Single static binary** — zero runtime dependencies
 
@@ -150,6 +151,9 @@ cargo install --path . --force
 # View a local PDB file
 proteinview examples/1AOI.pdb
 
+# Browse every supported structure under a directory
+proteinview examples --fullhd
+
 # HD mode (fast text-based shading)
 proteinview examples/4HHB.pdb --hd
 
@@ -247,6 +251,16 @@ unchanged.
 
 ## Keybindings
 
+Pass a directory instead of a file to start with the file browser open. It
+searches that directory recursively for PDB, ENT, CIF, mmCIF, and XYZ files.
+Use `j`/`k` or the arrow keys to choose a structure and `Enter` to load it;
+focus then returns to the 3D viewer so its regular controls work immediately.
+`Tab` moves focus between the browser and viewer, and `e` hides or reveals the
+browser. Opening one file directly starts with the browser hidden, but `e`
+reveals the other structures in that file's directory. The compact footer says
+`EDITOR` when the file list owns input and `PROTEINVIEW` when the 3D view does;
+press `?` in either mode for the complete keybinding reference.
+
 | Key | Action |
 |-----|--------|
 | `h`/`l` | Rotate Y |
@@ -268,6 +282,8 @@ unchanged.
 | `b` | Ball-and-stick for the selection |
 | `z` | Centre the view on the selection |
 | `Space` | Auto-rotate |
+| `e` | Show/hide the file browser |
+| `Tab` | Focus file browser / 3D viewer |
 | `?` | Help |
 | `q` | Quit |
 
