@@ -125,7 +125,7 @@ pub fn save_png(mut protein: Protein, output_path: &Path, options: SnapshotOptio
     );
     if options.show_outline {
         let radius = (f64::from(options.width) / 800.0).clamp(1.0, 3.0).round() as usize;
-        framebuffer.apply_outline(crate::config::palette().outline.color.0, radius);
+        framebuffer.apply_outline(crate::config::palette().outline.color.0, radius, 1.0);
     }
     let image = DynamicImage::ImageRgba8(framebuffer.to_rgba_image());
     write_png_atomically(&image, output_path)

@@ -104,7 +104,7 @@ pub fn render_viewport(frame: &mut Frame, area: Rect, app: &App) {
                 selection,
             );
             if app.show_outline {
-                fb.apply_outline(palette().outline.color.0, 1);
+                fb.apply_outline(palette().outline.color.0, 1, 1.0);
             }
 
             let widget = framebuffer_to_braille_widget(&fb);
@@ -163,7 +163,7 @@ fn render_hdplus_viewport(
         ssaa,
     );
     if app.show_outline {
-        fb.apply_outline(palette().outline.color.0, HD_SSAA);
+        fb.apply_outline(palette().outline.color.0, HD_SSAA, ssaa);
     }
 
     let widget =
@@ -234,7 +234,7 @@ fn render_fullhd_viewport(
     if app.show_outline {
         let display_radius = (still_w / 800.0).clamp(1.0, 3.0);
         let render_radius = (display_radius * scale).round().max(1.0) as usize;
-        fb.apply_outline(palette().outline.color.0, render_radius);
+        fb.apply_outline(palette().outline.color.0, render_radius, scale);
     }
 
     // If the terminal supports a real graphics protocol, hand it the pixels.

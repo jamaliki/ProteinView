@@ -169,7 +169,7 @@ impl PanelSession {
             let radius = (f64::from(self.settings.width) / 800.0)
                 .clamp(1.0, 3.0)
                 .round() as usize;
-            framebuffer.apply_outline(crate::config::palette().outline.color.0, radius);
+            framebuffer.apply_outline(crate::config::palette().outline.color.0, radius, 1.0);
         }
         let image = DynamicImage::ImageRgba8(framebuffer.to_rgba_image());
         write_png_atomically(&image, &self.output_path)?;

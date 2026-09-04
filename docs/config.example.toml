@@ -156,8 +156,8 @@ rainbow = "FF00FF"  # ligands under the Rainbow scheme
 # color = "1A1B26"
 
 # --- Traced outline ('o') ---------------------------------------------------
-# Color for exterior, overlap, and structural-region edges. The pale default is
-# visible on dark terminals; use a dark ink with a light background.
+# Color for exterior and overlap edges. The pale default is visible on dark
+# terminals; use a dark ink with a light background.
 [outline]
 color = "D8DEE9"
 

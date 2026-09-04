@@ -372,8 +372,9 @@ built-in CPK table, so overriding carbon leaves the rest alone, while
 `[chain] colors` replaces the chain cycle outright.
 
 Outline mode traces both the exterior and internal screen-space boundaries
-between overlapping or differently colored structural regions in every render
-tier. Press `o`, pass `--outline`, or set `[defaults] outline = true`. Its color
+between overlapping structural regions in every render tier. It deliberately
+ignores lighting and color changes so low-resolution modes stay clean. Press
+`o`, pass `--outline`, or set `[defaults] outline = true`. Its color
 belongs to the active palette and defaults to a pale neutral that is visible on
 dark terminals:
 

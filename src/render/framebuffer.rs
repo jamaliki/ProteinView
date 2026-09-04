@@ -63,24 +63,6 @@ fn blend_fog(c: &mut [u8; 3], fog_color: [u8; 3], blend: f32, desaturation: f32)
     }
 }
 
-/// Manhattan distance between normalized RGB chromaticities. Pure brightness
-/// changes have distance zero, while distinct material hues approach two.
-fn chroma_distance(a: [u8; 3], b: [u8; 3]) -> f32 {
-    let a_sum = f32::from(a[0]) + f32::from(a[1]) + f32::from(a[2]);
-    let b_sum = f32::from(b[0]) + f32::from(b[1]) + f32::from(b[2]);
-    if a_sum == 0.0 || b_sum == 0.0 {
-        return if a == b { 0.0 } else { 2.0 };
-    }
-    a.iter()
-        .zip(b.iter())
-        .map(|(&left, &right)| (f32::from(left) / a_sum - f32::from(right) / b_sum).abs())
-        .sum()
-}
-
-fn rgb_key(color: [u8; 3]) -> u32 {
-    (u32::from(color[0]) << 16) | (u32::from(color[1]) << 8) | u32::from(color[2])
-}
-
 /// RGB pixel framebuffer with z-buffer for software rasterization.
 ///
 /// Pixel coordinates: (0,0) is top-left, x increases right, y increases down.
@@ -367,11 +349,14 @@ impl Framebuffer {
     ///
     /// The original depth mask is expanded by `radius` pixels for the exterior
     /// ring. Internal contours are added on the farther side of occlusion depth
-    /// jumps and on one side of abrupt chroma changes, separating overlapping
-    /// structures and differently colored regions without double-width lines.
+    /// jumps, separating overlapping structure without tracing lighting or
+    /// color changes.
     /// A finite sentinel depth marks the exterior ring as rendered while
     /// keeping it behind real geometry during braille color selection.
-    pub fn apply_outline(&mut self, color: [u8; 3], radius: usize) {
+    /// `render_scale` is the framebuffer size relative to its displayed size:
+    /// 2 for HDplus supersampling, 1 normally, and below 1 for a reduced moving
+    /// FullHD frame. It keeps edge sensitivity and thickness visually stable.
+    pub fn apply_outline(&mut self, color: [u8; 3], radius: usize, render_scale: f64) {
         if radius == 0 {
             return;
         }
@@ -385,11 +370,18 @@ impl Framebuffer {
             return;
         }
 
-        // Detect internal structure boundaries before expanding the mask.
-        // Color is compared as chromaticity, making the test insensitive to
-        // Lambert brightness changes across one material. Depth contours are
-        // drawn on the farther surface, like an ink line at an occlusion.
-        const DEPTH_EDGE_THRESHOLD: f32 = 0.8;
+        // A fixed world-space jump is far too sensitive at HD's coarse grid:
+        // adjacent samples on an ordinary sloping ribbon can differ by nearly
+        // an angstrom. Scale the discontinuity threshold from the 800-pixel
+        // FullHD tuning point, then convert it into framebuffer-sample units.
+        let render_scale = render_scale.max(f64::EPSILON) as f32;
+        let displayed_width = self.width as f32 / render_scale;
+        let displayed_depth_threshold = (0.8 * 800.0 / displayed_width).clamp(0.8, 4.0);
+        let sample_depth_threshold = displayed_depth_threshold / render_scale;
+
+        // Looking out to `radius` makes an HDplus contour survive its 2x2 box
+        // filter. Multiplying the threshold by sample distance prevents a
+        // smooth depth slope from being mistaken for an edge.
         let internal_edges: Vec<u8> = (0..self.depth.len())
             .into_par_iter()
             .map(|index| {
@@ -398,24 +390,19 @@ impl Framebuffer {
                 }
                 let x = index % self.width;
                 let y = index / self.width;
-                let y0 = y.saturating_sub(1);
-                let y1 = (y + 1).min(self.height - 1);
-                let x0 = x.saturating_sub(1);
-                let x1 = (x + 1).min(self.width - 1);
+                let y0 = y.saturating_sub(radius);
+                let y1 = (y + radius).min(self.height - 1);
+                let x0 = x.saturating_sub(radius);
+                let x1 = (x + radius).min(self.width - 1);
                 let depth = self.depth[index];
-                let pixel = self.color[index];
                 for near_y in y0..=y1 {
                     for near_x in x0..=x1 {
                         let near_index = near_y * self.width + near_x;
                         if original[near_index] == 0 || near_index == index {
                             continue;
                         }
-                        if self.depth[near_index] + DEPTH_EDGE_THRESHOLD < depth {
-                            return 1;
-                        }
-                        let near_pixel = self.color[near_index];
-                        if chroma_distance(pixel, near_pixel) > 0.45
-                            && rgb_key(pixel) < rgb_key(near_pixel)
+                        let sample_distance = x.abs_diff(near_x).max(y.abs_diff(near_y)) as f32;
+                        if self.depth[near_index] + sample_depth_threshold * sample_distance < depth
                         {
                             return 1;
                         }
@@ -1551,7 +1538,7 @@ mod tests {
     fn outline_adds_only_an_exterior_ring() {
         let mut fb = Framebuffer::new(7, 7);
         fb.set_pixel(3, 3, 2.0, [200, 100, 50]);
-        fb.apply_outline([1, 2, 3], 1);
+        fb.apply_outline([1, 2, 3], 1, 1.0);
 
         let drawn = fb.depth.iter().filter(|depth| depth.is_finite()).count();
         assert_eq!(drawn, 9, "one pixel should gain its eight neighbours");
@@ -1566,7 +1553,7 @@ mod tests {
     fn outline_radius_expands_without_filling_the_original() {
         let mut fb = Framebuffer::new(7, 7);
         fb.set_pixel(3, 3, 2.0, [200, 100, 50]);
-        fb.apply_outline([8, 9, 10], 2);
+        fb.apply_outline([8, 9, 10], 2, 1.0);
 
         assert_eq!(
             fb.depth.iter().filter(|depth| depth.is_finite()).count(),
@@ -1582,11 +1569,11 @@ mod tests {
         let mut fb = Framebuffer::new(8, 3);
         for y in 0..3 {
             for x in 0..8 {
-                let depth = if x < 4 { 1.0 } else { 4.0 };
+                let depth = if x < 4 { 1.0 } else { 10.0 };
                 fb.set_pixel(x, y, depth, [120, 80, 40]);
             }
         }
-        fb.apply_outline([1, 2, 3], 1);
+        fb.apply_outline([1, 2, 3], 1, 1.0);
 
         assert_eq!(fb.color[4], [1, 2, 3], "far side should carry the ink");
         assert_eq!(
@@ -1602,7 +1589,7 @@ mod tests {
     }
 
     #[test]
-    fn outline_traces_material_changes_but_not_brightness_changes() {
+    fn outline_ignores_color_and_brightness_changes() {
         let mut materials = Framebuffer::new(8, 3);
         let mut shading = Framebuffer::new(8, 3);
         for y in 0..3 {
@@ -1613,11 +1600,43 @@ mod tests {
                 shading.set_pixel(x, y, 1.0, shade);
             }
         }
-        materials.apply_outline([1, 2, 3], 1);
-        shading.apply_outline([1, 2, 3], 1);
+        materials.apply_outline([1, 2, 3], 1, 1.0);
+        shading.apply_outline([1, 2, 3], 1, 1.0);
 
-        assert!(materials.color.iter().any(|pixel| *pixel == [1, 2, 3]));
+        assert!(!materials.color.iter().any(|pixel| *pixel == [1, 2, 3]));
         assert!(!shading.color.iter().any(|pixel| *pixel == [1, 2, 3]));
+    }
+
+    #[test]
+    fn hd_outline_ignores_a_continuous_depth_slope() {
+        let mut fb = Framebuffer::new(160, 3);
+        for y in 0..3 {
+            for x in 0..160 {
+                fb.set_pixel(x, y, x as f32 * 1.0, [120, 80, 40]);
+            }
+        }
+        fb.apply_outline([1, 2, 3], 1, 1.0);
+
+        assert!(
+            !fb.color.iter().any(|pixel| *pixel == [1, 2, 3]),
+            "HD depth gradients must not turn into noisy contours"
+        );
+    }
+
+    #[test]
+    fn hdplus_outline_survives_supersample_filtering() {
+        let mut fb = Framebuffer::new(320, 3);
+        for y in 0..3 {
+            for x in 0..320 {
+                let depth = if x < 160 { 1.0 } else { 10.0 };
+                fb.set_pixel(x, y, depth, [120, 80, 40]);
+            }
+        }
+        fb.apply_outline([1, 2, 3], 2, 2.0);
+
+        assert_eq!(fb.color[160], [1, 2, 3]);
+        assert_eq!(fb.color[161], [1, 2, 3]);
+        assert_eq!(fb.color[162], [120, 80, 40]);
     }
 
     #[test]

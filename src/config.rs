@@ -401,7 +401,7 @@ pub struct Defaults {
     pub ligands: Option<bool>,
     /// Spin the structure when nothing else is driving the camera.
     pub auto_rotate: Option<bool>,
-    /// Trace screen-space exterior, overlap, and material boundaries.
+    /// Trace screen-space exterior and overlap boundaries.
     pub outline: Option<bool>,
 }
 
