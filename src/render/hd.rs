@@ -2,7 +2,7 @@ use crate::app::VizMode;
 use crate::model::interface::{Interaction, InteractionType};
 use crate::model::protein::{Atom, LigandType, MoleculeType, Protein, Residue};
 use crate::model::residue_selection::SelectionView;
-use crate::render::bond::atoms_bonded;
+use crate::render::bond::{atoms_bonded, vdw_radius};
 use crate::render::camera::Camera;
 use crate::render::color::{ColorScheme, color_to_rgb};
 use crate::render::framebuffer::{Framebuffer, default_light_dir};
@@ -972,56 +972,6 @@ impl BallAndStick {
     /// Bond thickness (diameter), the same for every element.
     fn stick(&self) -> f64 {
         (2.0 * STICK_RADIUS * self.zoom).max(MIN_STICK_THICKNESS * self.ts)
-    }
-}
-
-/// Van der Waals radius (Å) for an element symbol.
-///
-/// Bondi (J. Phys. Chem. 1964) with the later Rowland/Taylor and Mantina
-/// revisions, the same set PyMOL ships.  Only the ratios matter here, so
-/// anything unlisted takes a mid-range 1.8 Å rather than a per-element guess.
-fn vdw_radius(element: &str) -> f64 {
-    match element.trim() {
-        "H" | "h" => 1.10,
-        "He" | "HE" | "he" => 1.40,
-        "Li" | "LI" | "li" => 1.81,
-        "Be" | "BE" | "be" => 1.53,
-        "B" | "b" => 1.92,
-        "C" | "c" => 1.70,
-        "N" | "n" => 1.55,
-        "O" | "o" => 1.52,
-        "F" | "f" => 1.47,
-        "Ne" | "NE" | "ne" => 1.54,
-        "Na" | "NA" | "na" => 2.27,
-        "Mg" | "MG" | "mg" => 1.73,
-        "Al" | "AL" | "al" => 1.84,
-        "Si" | "SI" | "si" => 2.10,
-        "P" | "p" => 1.80,
-        "S" | "s" => 1.80,
-        "Cl" | "CL" | "cl" => 1.75,
-        "Ar" | "AR" | "ar" => 1.88,
-        "K" | "k" => 2.75,
-        "Ca" | "CA" | "ca" => 2.31,
-        "Mn" | "MN" | "mn" => 2.05,
-        "Fe" | "FE" | "fe" => 2.04,
-        "Co" | "CO" | "co" => 2.00,
-        "Ni" | "NI" | "ni" => 1.97,
-        "Cu" | "CU" | "cu" => 1.96,
-        "Zn" | "ZN" | "zn" => 2.01,
-        "Se" | "SE" | "se" => 1.90,
-        "Br" | "BR" | "br" => 1.85,
-        "Kr" | "KR" | "kr" => 2.02,
-        "Mo" | "MO" | "mo" => 2.10,
-        "Ag" | "AG" | "ag" => 2.11,
-        "Cd" | "CD" | "cd" => 2.18,
-        "I" | "i" => 1.98,
-        "Xe" | "XE" | "xe" => 2.16,
-        "Pt" | "PT" | "pt" => 2.13,
-        "Au" | "AU" | "au" => 2.14,
-        "Hg" | "HG" | "hg" => 2.09,
-        "Pb" | "PB" | "pb" => 2.02,
-        "U" | "u" => 1.86,
-        _ => 1.80,
     }
 }
 
