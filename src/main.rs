@@ -68,6 +68,11 @@ struct Cli {
     #[arg(long, alias = "palette", value_name = "FILE")]
     config: Option<PathBuf>,
 
+    /// Start on this named palette from the config file, rather than
+    /// `defaults.palette`. `p` cycles between them in the TUI
+    #[arg(long, value_name = "NAME")]
+    palette_name: Option<String>,
+
     /// Visualization mode: cartoon, backbone, wireframe
     /// [default: cartoon, or `defaults.mode` from the config file]
     #[arg(long)]
@@ -188,7 +193,23 @@ fn main() -> Result<()> {
     // bad config is a hard error rather than a silent fallback: ignoring a file
     // the user wrote is worse than refusing to start.
     config::init(cli.config.as_deref())?;
-    let defaults = config::config().defaults;
+    // A palette named on the command line beats the one the file starts on.
+    // Naming one that does not exist is an error rather than a silent fallback
+    // to `default`: a snapshot cannot show you it was ignored.
+    if let Some(name) = &cli.palette_name {
+        if !config::set_palette(name) {
+            let known: Vec<&str> = config::config()
+                .palettes
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect();
+            anyhow::bail!(
+                "no palette named {name:?} in the config; this file has {}",
+                known.join(", ")
+            );
+        }
+    }
+    let defaults = &config::config().defaults;
 
     // Rasterization splits the framebuffer into bands, so it scales with cores
     // until it becomes memory-bound.  Default to one thread per core: with the
@@ -562,6 +583,14 @@ fn main() -> Result<()> {
                             app.note_camera_change();
                         }
                         KeyCode::Char('c') => app.cycle_color(),
+                        // Named palettes from the config file.  Silent when the
+                        // file defines none, since there is nothing to show.
+                        KeyCode::Char('p') => {
+                            app.cycle_palette(true);
+                        }
+                        KeyCode::Char('P') => {
+                            app.cycle_palette(false);
+                        }
                         KeyCode::Char('v') => app.cycle_viz_mode(),
                         KeyCode::Char('m') => {
                             let (cols, rows) =

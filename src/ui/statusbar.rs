@@ -77,6 +77,20 @@ pub fn render_statusbar(frame: &mut Frame, area: Rect, app: &App) {
             Span::raw(" "),
         ]);
 
+        // Name the palette only when there is more than one to be in: with a
+        // plain config there is nothing to disambiguate and the bar is busy.
+        if crate::config::palette_count() > 1 {
+            spans.push(Span::styled(
+                "\u{2502} ",
+                Style::default().fg(Color::DarkGray),
+            ));
+            spans.push(Span::styled(
+                crate::config::palette_name(),
+                Style::default().fg(Color::Cyan),
+            ));
+            spans.push(Span::raw(" "));
+        }
+
         // Show SSH indicator
         if app.connection_type == ConnectionType::Ssh {
             spans.push(Span::styled(

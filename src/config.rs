@@ -17,6 +17,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Deserializer};
@@ -358,9 +359,12 @@ impl Fog {
 /// behaviour, including the heuristics that pick a mode from the file itself,
 /// still applies.  A command-line flag always wins over the file, and the file
 /// always wins over a heuristic -- someone who wrote a preference down meant it.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Defaults {
+    /// Which named palette to open with.  Must name one that the file defines,
+    /// or `default` for the colors written at the top level.
+    pub palette: Option<String>,
     /// Render tier: `braille`, `halfblock`, `hdplus` or `fullhd`.  Same
     /// spellings as `--render`.
     #[serde(deserialize_with = "de_render_mode")]
@@ -484,13 +488,43 @@ impl Palette {
 // Config
 // ---------------------------------------------------------------------------
 
+/// A palette under the name the file gave it.
+#[derive(Debug, Clone)]
+pub struct NamedPalette {
+    pub name: String,
+    pub palette: Palette,
+}
+
 /// Everything resolved from the config file: built-in values with any
 /// configured overrides applied.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Config {
-    pub palette: Palette,
+    /// Every palette the file defines, in the order written, and never empty:
+    /// index 0 is `default`, built from the top-level color sections.  `p`
+    /// cycles through them at runtime, which is why the order is the file's
+    /// rather than whatever a hash map happens to yield.
+    pub palettes: Vec<NamedPalette>,
+    /// Index into `palettes` that the session starts on.
+    pub start_palette: usize,
     pub fog: Fog,
     pub defaults: Defaults,
+}
+
+/// The name of the palette built from the top-level color sections.
+pub const BASE_PALETTE: &str = "default";
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            palettes: vec![NamedPalette {
+                name: BASE_PALETTE.to_string(),
+                palette: Palette::default(),
+            }],
+            start_palette: 0,
+            fog: Fog::default(),
+            defaults: Defaults::default(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -518,12 +552,17 @@ struct ChainFile {
     colors: Option<Vec<Rgb>>,
 }
 
-/// The file as written.  Color sections sit at the top level, where they have
-/// always been, so a palette file from before the config grew past colors still
-/// parses unchanged; `fog` and `defaults` are new sections beside them.
+/// One palette's worth of color sections.
+///
+/// The top level of the file is one of these, and so is every `[[palette]]`
+/// entry, which is what makes a named palette exactly as expressive as the
+/// colors written at the root.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-struct ConfigFile {
+struct PaletteFile {
+    /// Names the palette in `[[palette]]`; unused at the top level, which is
+    /// always [`BASE_PALETTE`].
+    name: String,
     structure: StructurePalette,
     nucleotide: NucleotidePalette,
     chain: ChainFile,
@@ -533,12 +572,17 @@ struct ConfigFile {
     interface: InterfacePalette,
     ligand: LigandPalette,
     selection: SelectionPalette,
-    fog: Fog,
-    defaults: Defaults,
 }
 
-impl ConfigFile {
-    fn resolve(self) -> Result<Config> {
+impl PaletteFile {
+    /// Built-in defaults with this file's colors applied.
+    ///
+    /// Every palette resolves against the built-ins, including the named ones:
+    /// a `[[palette]]` is a whole palette rather than a patch on the top-level
+    /// colors, so reading one tells you what it draws without also holding the
+    /// rest of the file in your head.  `where` says which palette an error is
+    /// about, since by this point they all look alike.
+    fn resolve(self, where_: &str) -> Result<Palette> {
         let mut palette = Palette {
             structure: self.structure,
             nucleotide: self.nucleotide,
@@ -553,7 +597,7 @@ impl ConfigFile {
 
         if let Some(colors) = self.chain.colors {
             if colors.is_empty() {
-                anyhow::bail!("`chain.colors` must list at least one color");
+                anyhow::bail!("`{where_}chain.colors` must list at least one color");
             }
             palette.chains = colors;
         }
@@ -567,10 +611,94 @@ impl ConfigFile {
                 .insert(symbol.trim().to_ascii_uppercase(), color);
         }
 
+        Ok(palette)
+    }
+}
+
+/// The file as written.  Color sections sit at the top level, where they have
+/// always been, so a palette file from before the config grew past colors still
+/// parses unchanged; `fog`, `defaults` and `palette` are new sections beside
+/// them.
+///
+/// The color fields are spelled out again rather than shared with
+/// [`PaletteFile`] because `serde(flatten)` and `deny_unknown_fields` cannot
+/// both apply to one struct, and rejecting typos is worth more than the nine
+/// lines.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ConfigFile {
+    structure: StructurePalette,
+    nucleotide: NucleotidePalette,
+    chain: ChainFile,
+    element: ElementFile,
+    plddt: PlddtPalette,
+    bfactor: BFactorPalette,
+    interface: InterfacePalette,
+    ligand: LigandPalette,
+    selection: SelectionPalette,
+    fog: Fog,
+    defaults: Defaults,
+    /// Additional named palettes, as an array of tables so the cycling order is
+    /// the order they were written in.
+    palette: Vec<PaletteFile>,
+}
+
+impl ConfigFile {
+    fn resolve(self) -> Result<Config> {
+        let base = PaletteFile {
+            name: BASE_PALETTE.to_string(),
+            structure: self.structure,
+            nucleotide: self.nucleotide,
+            chain: self.chain,
+            element: self.element,
+            plddt: self.plddt,
+            bfactor: self.bfactor,
+            interface: self.interface,
+            ligand: self.ligand,
+            selection: self.selection,
+        };
+
+        let mut palettes = vec![NamedPalette {
+            name: BASE_PALETTE.to_string(),
+            palette: base.resolve("")?,
+        }];
+
+        for entry in self.palette {
+            let name = entry.name.trim().to_string();
+            if name.is_empty() {
+                anyhow::bail!(
+                    "every `[[palette]]` needs a `name`, which is what `p` shows and `defaults.palette` selects"
+                );
+            }
+            if palettes.iter().any(|p| p.name == name) {
+                anyhow::bail!("two palettes are named {name:?}; cycling could not tell them apart");
+            }
+            let palette = entry.resolve(&format!("palette.{name}."))?;
+            palettes.push(NamedPalette { name, palette });
+        }
+
+        // A start palette that does not exist is a typo worth stopping for: the
+        // alternative is opening in `default` and leaving the user to wonder
+        // why their colors did nothing.
+        let start_palette = match &self.defaults.palette {
+            Some(wanted) => palettes
+                .iter()
+                .position(|p| p.name == wanted.trim())
+                .with_context(|| {
+                    let known: Vec<&str> = palettes.iter().map(|p| p.name.as_str()).collect();
+                    format!(
+                        "`defaults.palette` names {wanted:?}, which is not defined; this file has {}",
+                        known.join(", ")
+                    )
+                })?,
+            None => 0,
+        };
+
         self.fog.validate()?;
 
         Ok(Config {
-            palette,
+            palettes,
+            start_palette,
             fog: self.fog,
             defaults: self.defaults,
         })
@@ -609,14 +737,67 @@ pub fn default_config_paths() -> Vec<PathBuf> {
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
 
+/// Index into `config().palettes` of the palette being drawn.
+///
+/// The config itself is immutable once resolved, but which of its palettes is
+/// active changes whenever the user presses `p`.  An atomic index keeps
+/// [`palette`] returning a `&'static Palette`, so the hundred call sites that
+/// just want a color stay as they are.
+static ACTIVE_PALETTE: AtomicUsize = AtomicUsize::new(0);
+
 /// The active config.  Defaults are used if [`init`] was never called.
 pub fn config() -> &'static Config {
     CONFIG.get_or_init(Config::default)
 }
 
-/// The active palette, the part of the config nearly every caller wants.
+/// The palette being drawn, the part of the config nearly every caller wants.
 pub fn palette() -> &'static Palette {
-    &config().palette
+    let all = &config().palettes;
+    // Saturating rather than wrapping: an index can only be stale if the config
+    // was replaced under us, and drawing the last palette beats panicking.
+    &all[ACTIVE_PALETTE.load(Ordering::Relaxed).min(all.len() - 1)].palette
+}
+
+/// Name of the palette being drawn.
+pub fn palette_name() -> &'static str {
+    let all = &config().palettes;
+    &all[ACTIVE_PALETTE.load(Ordering::Relaxed).min(all.len() - 1)].name
+}
+
+/// How many palettes the config defines.  Always at least one.
+pub fn palette_count() -> usize {
+    config().palettes.len()
+}
+
+/// Step to the next palette (or the previous one), wrapping at both ends, and
+/// return its name.  A no-op when the file defines only the default.
+pub fn cycle_palette(forward: bool) -> &'static str {
+    let count = palette_count();
+    if count > 1 {
+        let current = ACTIVE_PALETTE.load(Ordering::Relaxed).min(count - 1);
+        ACTIVE_PALETTE.store(next_index(current, count, forward), Ordering::Relaxed);
+    }
+    palette_name()
+}
+
+/// The neighbouring index in a cycle of `count`, wrapping at both ends.
+fn next_index(current: usize, count: usize, forward: bool) -> usize {
+    if forward {
+        (current + 1) % count
+    } else {
+        (current + count - 1) % count
+    }
+}
+
+/// Select a palette by name, returning whether one by that name exists.
+pub fn set_palette(name: &str) -> bool {
+    match config().palettes.iter().position(|p| p.name == name) {
+        Some(index) => {
+            ACTIVE_PALETTE.store(index, Ordering::Relaxed);
+            true
+        }
+        None => false,
+    }
 }
 
 /// Resolve the config once, from `explicit` if given, else from the first
@@ -636,6 +817,7 @@ pub fn init(explicit: Option<&Path>) -> Result<Option<PathBuf>> {
         None => (Config::default(), None),
     };
 
+    ACTIVE_PALETTE.store(resolved.start_palette, Ordering::Relaxed);
     let _ = CONFIG.set(resolved);
     Ok(loaded)
 }
@@ -646,7 +828,7 @@ mod tests {
 
     /// Most of these tests are about colors; unwrap the palette for them.
     fn parse_palette(text: &str) -> Result<Palette> {
-        Ok(parse(text)?.palette)
+        Ok(parse(text)?.palettes.remove(0).palette)
     }
 
     #[test]
@@ -747,7 +929,10 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert_eq!(c.palette.structure.helix, Rgb::new(0x11, 0x22, 0x33));
+        assert_eq!(
+            c.palettes[0].palette.structure.helix,
+            Rgb::new(0x11, 0x22, 0x33)
+        );
         assert_eq!(c.fog, Fog::default());
         assert_eq!(c.defaults, Defaults::default());
     }
@@ -851,6 +1036,156 @@ mod tests {
                 "a typo should be an error, not silence: {text:?}"
             );
         }
+    }
+
+    #[test]
+    fn named_palettes_keep_the_order_they_were_written_in() {
+        // Cycling order is the file's order, which is why these are an array of
+        // tables rather than a map: a map would hand them back in hash order.
+        let c = parse(
+            r#"
+            [[palette]]
+            name = "ocean"
+            [palette.structure]
+            helix = "0088FF"
+
+            [[palette]]
+            name = "amber"
+            [palette.structure]
+            helix = "FFAA00"
+            "#,
+        )
+        .unwrap();
+
+        let names: Vec<&str> = c.palettes.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["default", "ocean", "amber"]);
+        assert_eq!(
+            c.palettes[1].palette.structure.helix,
+            Rgb::new(0, 0x88, 0xFF)
+        );
+        assert_eq!(
+            c.palettes[2].palette.structure.helix,
+            Rgb::new(0xFF, 0xAA, 0)
+        );
+    }
+
+    #[test]
+    fn a_named_palette_is_whole_rather_than_a_patch_on_the_base() {
+        // Every palette resolves against the built-ins, so reading one tells you
+        // what it draws without holding the top of the file in your head.
+        let c = parse(
+            r#"
+            [structure]
+            helix = "111111"
+            sheet = "222222"
+
+            [[palette]]
+            name = "mono"
+            [palette.structure]
+            helix = "CCCCCC"
+            "#,
+        )
+        .unwrap();
+
+        let mono = &c.palettes[1].palette;
+        assert_eq!(mono.structure.helix, Rgb::new(0xCC, 0xCC, 0xCC));
+        assert_eq!(
+            mono.structure.sheet,
+            StructurePalette::default().sheet,
+            "an unmentioned color comes from the built-in default, not the base palette"
+        );
+    }
+
+    #[test]
+    fn a_named_palette_can_set_everything_the_top_level_can() {
+        let c = parse(
+            r#"
+            [[palette]]
+            name = "full"
+            [palette.chain]
+            colors = ["FF0000", "00FF00"]
+            [palette.element.symbols]
+            C = "010203"
+            [palette.selection]
+            marker = "FFFFFF"
+            "#,
+        )
+        .unwrap();
+
+        let full = &c.palettes[1].palette;
+        assert_eq!(full.chains.len(), 2);
+        assert_eq!(full.element.get("C"), Rgb::new(1, 2, 3));
+        assert_eq!(full.element.get("ZN"), Rgb::new(125, 128, 176));
+        assert_eq!(full.selection.marker, Rgb::new(255, 255, 255));
+    }
+
+    #[test]
+    fn a_nameless_or_repeated_palette_is_rejected() {
+        let err = parse("[[palette]]\n[palette.structure]\nhelix = \"FF0000\"")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("name"), "unhelpful error: {err}");
+
+        let err = parse("[[palette]]\nname = \"x\"\n\n[[palette]]\nname = \"x\"")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("two palettes"), "unhelpful error: {err}");
+
+        // `default` is taken by the top-level colors.
+        let err = parse("[[palette]]\nname = \"default\"")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("two palettes"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn an_error_inside_a_named_palette_says_which_one() {
+        let err = parse("[[palette]]\nname = \"ocean\"\n[palette.chain]\ncolors = []")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("palette.ocean.chain.colors"),
+            "the error should locate the palette: {err}"
+        );
+    }
+
+    #[test]
+    fn the_starting_palette_can_be_named_and_a_typo_is_caught() {
+        let file = r#"
+            [[palette]]
+            name = "ocean"
+
+            [defaults]
+            palette = "ocean"
+            "#;
+        assert_eq!(parse(file).unwrap().start_palette, 1);
+
+        let err = parse("[[palette]]\nname = \"ocean\"\n\n[defaults]\npalette = \"ocaen\"")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ocaen"), "should quote the bad name: {err}");
+        assert!(
+            err.contains("default, ocean"),
+            "should list what is available: {err}"
+        );
+    }
+
+    #[test]
+    fn cycling_wraps_in_both_directions() {
+        // The index arithmetic, away from the process-wide active palette that
+        // the real cycling reads.
+        assert_eq!(next_index(0, 3, true), 1);
+        assert_eq!(
+            next_index(2, 3, true),
+            0,
+            "forward off the end wraps to the start"
+        );
+        assert_eq!(
+            next_index(0, 3, false),
+            2,
+            "back off the start wraps to the end"
+        );
+        assert_eq!(next_index(0, 1, true), 0, "a lone palette cycles to itself");
     }
 
     #[test]

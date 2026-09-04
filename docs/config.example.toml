@@ -1,19 +1,53 @@
-# ProteinView configuration
+# ProteinView configuration -- every setting, at its built-in default
+# =============================================================================
 #
-# Copy to ~/.config/proteinview/config.toml to have it picked up automatically,
-# or point at it explicitly:
+# Copy this file to have it picked up automatically:
 #
-#     proteinview structure.pdb --config docs/config.example.toml
+#     mkdir -p ~/.config/proteinview
+#     cp docs/config.example.toml ~/.config/proteinview/config.toml
 #
-# Every key is optional. Anything you leave out keeps its built-in default, so a
-# file containing nothing but a single color is perfectly valid. Colors are six
-# hexadecimal digits, with or without a leading '#', in either case.
+# or point at one explicitly, which is how you keep several around:
 #
-# Unknown keys are an error rather than being ignored, so a typo tells you
-# instead of silently doing nothing.
+#     proteinview structure.pdb --config ~/my-configs/paper-figures.toml
 #
-# An older ~/.config/proteinview/palette.toml is still read when no config.toml
-# is there, so a file written when this held only colors keeps working.
+# ProteinView reads $XDG_CONFIG_HOME/proteinview/config.toml, falling back to
+# ~/.config/proteinview/config.toml. An older palette.toml in the same directory
+# is still read when no config.toml is there, so a file written when this held
+# only colors keeps working, and --palette still works as an alias for --config.
+#
+# HOW TO READ THIS FILE
+#
+#   * Every key is optional. Anything you leave out keeps its built-in default,
+#     so a file containing nothing but one color is perfectly valid -- you do
+#     not need to copy the whole thing to change one line.
+#
+#   * Every value below IS the built-in default. Copying this file wholesale
+#     gives you exactly the stock appearance, so you can edit downward from a
+#     working file rather than guessing at what a key expects.
+#
+#   * Colors are six hexadecimal digits, with or without a leading '#', in
+#     either case: "FF0080", "#ff0080" and "Ff0080" are the same color.
+#
+#   * Unknown keys are an error rather than being ignored, so a typo tells you
+#     at startup instead of silently doing nothing. So does an out-of-range
+#     number, and the message names the key.
+#
+# WHAT IS IN HERE
+#
+#   Colors      the sections down to [selection]: every fixed color drawn
+#   [fog]       how much distance dims a structure
+#   [defaults]  which modes ProteinView opens in
+#   [[palette]] extra named palettes, cycled with `p` at runtime
+#
+# =============================================================================
+
+
+# =============================================================================
+# COLORS
+# =============================================================================
+# These sections are the "default" palette -- the one ProteinView starts on and
+# the one `p` cycles back around to. Extra palettes go in [[palette]] blocks at
+# the bottom of this file, and each takes the same sections as these.
 
 # --- Structure scheme (the default, keyed by secondary structure) ------------
 [structure]
@@ -108,7 +142,10 @@ carbon = "00E68C"  # ball-and-stick carbons of picked residues
 marker = "00E68C"  # marker sphere shown when ball-and-stick is off ('b')
 cursor = "FFC800"  # the sequence panel's cursor cell
 
-# --- Depth fog ---------------------------------------------------------------
+
+# =============================================================================
+# DEPTH FOG
+# =============================================================================
 # How much a pixel fades toward `color` as it recedes. Applies to every
 # framebuffer render (HD, HDplus, FullHD, snapshots and the panel server);
 # braille has no depth buffer to fog.
@@ -131,7 +168,10 @@ reference_depth = 55.0      # angstroms; `strength` applies as given at this dep
 curve_gain      = 2.0       # how sharply a deep structure's contrast goes to the front
 desaturation    = 1.0       # chroma drained at the far plane of a deep structure
 
-# --- Startup defaults --------------------------------------------------------
+
+# =============================================================================
+# STARTUP DEFAULTS
+# =============================================================================
 # What ProteinView opens with. Each key is the default for the flag or key of
 # the same name, and the flag still wins when you pass one.
 #
@@ -145,3 +185,84 @@ color          = "structure"  # structure | chain | element | bfactor | rainbow 
 ball_and_stick = true         # picked residues as ball-and-stick rather than a marker ('b')
 ligands        = true         # draw ligands and ions ('g')
 auto_rotate    = false        # spin the structure on startup (space)
+
+# Which named palette to open on. "default" is the colors written above; any
+# other name has to match a [[palette]] below, or ProteinView refuses to start
+# rather than opening in the wrong colors. --palette-name overrides this.
+# palette = "ocean"
+
+
+# =============================================================================
+# NAMED PALETTES
+# =============================================================================
+# Extra palettes, cycled with `p` (and `P` to go back) while ProteinView is
+# running. The status bar names the one you are on, and `--palette-name ocean`
+# picks one up front -- which is how you get a snapshot in a chosen palette,
+# since a snapshot has no keyboard.
+#
+# The order below is the cycling order. The colors at the top of this file are
+# always first, under the name "default", so `p` goes:
+#
+#     default -> ocean -> print -> default -> ...
+#
+# Each [[palette]] takes exactly the same sections as the top of this file, with
+# a `palette.` prefix: [palette.structure], [palette.chain], [palette.element],
+# [palette.selection], and so on. Two rules worth knowing:
+#
+#   * A named palette is a WHOLE palette, not a patch on the colors above. What
+#     it does not mention comes from the built-in defaults, not from your
+#     top-level [structure]. That way reading one block tells you what it draws.
+#
+#   * `name` is required, and no two palettes may share one -- including
+#     "default", which the top-level colors already own.
+#
+# The two below are worked examples. Delete them, edit them, or add your own.
+
+# --- ocean: cool blues and teals, easier on the eyes for long sessions -------
+[[palette]]
+name = "ocean"
+
+[palette.structure]
+helix = "0091EA"   # deep blue
+sheet = "00BFA5"   # teal
+turn  = "5C6BC0"   # indigo
+coil  = "80DEEA"   # pale cyan
+
+[palette.chain]
+colors = [
+  "0091EA",
+  "00BFA5",
+  "7E57C2",
+  "26C6DA",
+  "5C6BC0",
+  "4DB6AC",
+]
+
+[palette.selection]
+carbon = "FFD54F"  # warm against a cool structure, so a pick stands out
+marker = "FFD54F"
+cursor = "FFECB3"
+
+# Note there is no [palette.fog] or [palette.defaults]: fog and startup defaults
+# are settings for the session, not properties of a palette, so they stay global
+# and cycling `p` leaves them alone.
+
+# --- print: high-contrast greys for figures and screenshots ------------------
+# A short palette: everything it leaves out -- elements, pLDDT bands, interface
+# colors -- keeps its built-in value, which is usually what you want.
+[[palette]]
+name = "print"
+
+[palette.structure]
+helix = "1A1A1A"
+sheet = "5C5C5C"
+turn  = "8C8C8C"
+coil  = "BFBFBF"
+
+[palette.chain]
+colors = ["1A1A1A", "5C5C5C", "8C8C8C", "BFBFBF"]
+
+[palette.selection]
+carbon = "D32F2F"  # the one bit of color, so a selection is unmistakable
+marker = "D32F2F"
+cursor = "D32F2F"

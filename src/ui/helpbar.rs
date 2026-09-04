@@ -16,7 +16,7 @@ pub fn render_helpbar(frame: &mut Frame, area: Rect, app: &App) {
         frame.render_widget(Paragraph::new(sequence_hints()), area);
         return;
     }
-    let help = Paragraph::new(Line::from(vec![
+    let mut spans = vec![
         Span::styled("╰── ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             "h/l",
@@ -53,6 +53,25 @@ pub fn render_helpbar(frame: &mut Frame, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(": color  ", Style::default().fg(Color::Gray)),
+    ];
+
+    // Only advertise the palette key when the config defines palettes to cycle:
+    // the bar is already full, and on a plain config `p` does nothing.  It sits
+    // next to the color key, which is the one it is a variation on.
+    if crate::config::palette_count() > 1 {
+        spans.push(Span::styled(
+            "p",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            ": palette  ",
+            Style::default().fg(Color::Gray),
+        ));
+    }
+
+    spans.extend([
         Span::styled(
             "v",
             Style::default()
@@ -103,8 +122,9 @@ pub fn render_helpbar(frame: &mut Frame, area: Rect, app: &App) {
         ),
         Span::styled(": quit ", Style::default().fg(Color::Gray)),
         Span::styled("──╯", Style::default().fg(Color::DarkGray)),
-    ]));
-    frame.render_widget(help, area);
+    ]);
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// Hints shown while the sequence panel has the arrow keys.

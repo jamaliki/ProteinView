@@ -317,7 +317,7 @@ impl App {
                 (vp_cols * 2.0, vp_rows * 4.0)
             }
         };
-        let defaults = crate::config::config().defaults;
+        let defaults = &crate::config::config().defaults;
 
         let mut camera = Camera::default();
         camera.zoom = 0.9 * px_w.min(px_h) / (2.0 * radius);
@@ -447,6 +447,22 @@ impl App {
                 .with_residue_colors(self.residue_colors.clone());
             self.mesh_dirty = true;
         }
+    }
+
+    /// Step to the next configured palette, or the previous one.
+    ///
+    /// Returns the name now active, or `None` when the config defines only one
+    /// palette and there is nothing to cycle.
+    ///
+    /// Colors are read from the palette as they are drawn, so nothing needs
+    /// rebuilding except the ribbon mesh, which bakes a color into every vertex.
+    pub fn cycle_palette(&mut self, forward: bool) -> Option<&'static str> {
+        if crate::config::palette_count() < 2 {
+            return None;
+        }
+        let name = crate::config::cycle_palette(forward);
+        self.mesh_dirty = true;
+        Some(name)
     }
 
     /// Whether the ribbon mesh will be rebuilt on the next `ribbon_mesh()` call.

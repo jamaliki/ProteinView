@@ -242,6 +242,7 @@ leave the prior frame, state, and revision unchanged.
 | `w`/`a`/`s`/`d` | Pan |
 | `r` | Reset view |
 | `c` | Cycle color scheme |
+| `p`/`P` | Cycle named palettes (see [Configuration](#configuration)) |
 | `v` | Cycle viz mode |
 | `m` | Braille / HD |
 | `M` | HD / FullHD |
@@ -349,6 +350,51 @@ max_strength = 0.6   # default 0.85; the ceiling for deep structures
 # strength = 0.0     # no fog at all
 ```
 
+### Named palettes
+
+A config file can define as many palettes as you like and cycle between them
+with `p` (and `P` to go back) while ProteinView is running. Each `[[palette]]`
+takes the same sections as the colors at the top of the file, under a
+`palette.` prefix:
+
+```toml
+[[palette]]
+name = "ocean"
+
+[palette.structure]
+helix = "0091EA"
+sheet = "00BFA5"
+
+[palette.chain]
+colors = ["0091EA", "00BFA5", "7E57C2"]
+
+[[palette]]
+name = "print"
+
+[palette.structure]
+helix = "1A1A1A"
+sheet = "5C5C5C"
+```
+
+The colors at the top of the file are always first in the cycle, under the name
+`default`, so `p` goes `default` → `ocean` → `print` → `default`. The status bar
+names the palette you are on whenever there is more than one to be in.
+
+A named palette is a *whole* palette rather than a patch on the colors above it:
+what it does not mention comes from the built-in defaults, so one block tells you
+what it draws. Names must be unique, and `default` is taken.
+
+`--palette-name <NAME>` opens on a given palette, which is how you get a snapshot
+in one, since a snapshot has no keyboard:
+
+```bash
+proteinview examples/4HHB.pdb --palette-name print --snapshot figure.png
+```
+
+`[defaults] palette = "ocean"` sets which one to open on without a flag. Naming
+a palette that does not exist is an error rather than a silent fall back to
+`default` — a snapshot cannot tell you it was ignored.
+
 ### Startup defaults
 
 `[defaults]` sets what ProteinView opens with. Each key is the default for the
@@ -359,6 +405,7 @@ flag or key of the same name, and passing the flag still wins:
 render = "fullhd"     # braille | halfblock | hdplus | fullhd
 mode = "cartoon"      # cartoon | backbone | wireframe
 color = "chain"       # structure | chain | element | bfactor | rainbow | plddt
+palette = "ocean"     # a [[palette]] name, or "default"
 ball_and_stick = true
 ligands = true
 auto_rotate = false

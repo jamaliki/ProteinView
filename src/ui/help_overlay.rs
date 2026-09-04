@@ -55,6 +55,10 @@ pub fn render_help_overlay(frame: &mut Frame, area: Rect) {
             Span::raw("Cycle color scheme"),
         ]),
         Line::from(vec![
+            Span::styled("  p / P      ", Style::default().fg(Color::Yellow)),
+            Span::raw("Cycle named palettes (config file)"),
+        ]),
+        Line::from(vec![
             Span::styled("  v          ", Style::default().fg(Color::Yellow)),
             Span::raw("Cycle viz mode"),
         ]),
