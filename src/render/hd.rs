@@ -581,6 +581,48 @@ fn span_end(x: f64, ceil_x: usize) -> usize {
     (i as usize).min(ceil_x)
 }
 
+/// World units per framebuffer pixel.
+///
+/// The projection scales x and y by the camera's zoom and leaves depth alone,
+/// so this is the factor that turns a radius picked in pixels into the depth
+/// range the sphere or cylinder actually occupies.  Zero for a degenerate
+/// camera, which the framebuffer reads as "keep the primitive flat".
+fn world_per_pixel(camera: &Camera) -> f64 {
+    if camera.zoom.is_finite() && camera.zoom > 1e-9 {
+        1.0 / camera.zoom
+    } else {
+        0.0
+    }
+}
+
+/// Draw one bond as two half-sticks, each in its own atom's colour.
+///
+/// A whole bond in the first atom's colour makes a carbonyl look like a carbon
+/// bond that happens to stop at an oxygen.  Splitting at the midpoint is what
+/// PyMOL and every other viewer does, and it is most of what makes element
+/// colouring readable at a glance.
+fn draw_bond(
+    fb: &mut Framebuffer,
+    p1: [f64; 3],
+    p2: [f64; 3],
+    c1: [u8; 3],
+    c2: [u8; 3],
+    thickness: f64,
+    world_per_px: f64,
+) {
+    if c1 == c2 {
+        fb.draw_thick_line_3d(p1, p2, c1, thickness, world_per_px);
+        return;
+    }
+    let mid = [
+        (p1[0] + p2[0]) * 0.5,
+        (p1[1] + p2[1]) * 0.5,
+        (p1[2] + p2[2]) * 0.5,
+    ];
+    fb.draw_thick_line_3d(p1, mid, c1, thickness, world_per_px);
+    fb.draw_thick_line_3d(mid, p2, c2, thickness, world_per_px);
+}
+
 /// Render backbone CA trace to framebuffer.
 fn render_backbone_fb(
     fb: &mut Framebuffer,
@@ -591,6 +633,7 @@ fn render_backbone_fb(
     half_h: f64,
     ts: f64,
 ) {
+    let world_per_px = world_per_pixel(camera);
     for chain in &protein.chains {
         let mut prev: Option<([f64; 3], [u8; 3])> = None;
         for residue in &chain.residues {
@@ -598,9 +641,9 @@ fn render_backbone_fb(
                 let p = camera.project(ca.x, ca.y, ca.z);
                 let px = to_pixel(p.x, p.y, p.z, half_w, half_h);
                 let color = color_to_rgb(color_scheme.residue_color(residue, chain));
-                fb.draw_circle_z(px[0], px[1], px[2], 2.5 * ts, color);
+                fb.draw_sphere(px[0], px[1], px[2], 2.5 * ts, world_per_px, color);
                 if let Some((prev_px, prev_color)) = prev {
-                    fb.draw_thick_line_3d(prev_px, px, prev_color, 2.0 * ts);
+                    draw_bond(fb, prev_px, px, prev_color, color, 2.0 * ts, world_per_px);
                 }
                 prev = Some((px, color));
             }
@@ -623,6 +666,7 @@ fn render_wireframe_fb(
     half_h: f64,
     ts: f64,
 ) {
+    let world_per_px = world_per_pixel(camera);
     for chain in &protein.chains {
         for residue in &chain.residues {
             let projected: Vec<_> = residue
@@ -639,16 +683,16 @@ fn render_wireframe_fb(
             // Draw small dots at atom positions so atoms are visible at bond
             // intersections.
             for (_, px, color) in &projected {
-                fb.draw_circle_z(px[0], px[1], px[2], 1.5 * ts, *color);
+                fb.draw_sphere(px[0], px[1], px[2], 1.5 * ts, world_per_px, *color);
             }
 
             // Intra-residue bonds (thick lines)
             for i in 0..projected.len() {
                 for j in (i + 1)..projected.len() {
                     let (a1, p1, c1) = &projected[i];
-                    let (a2, p2, _) = &projected[j];
+                    let (a2, p2, c2) = &projected[j];
                     if atoms_bonded(&a1.element, a1.x, a1.y, a1.z, &a2.element, a2.x, a2.y, a2.z) {
-                        fb.draw_thick_line_3d(*p1, *p2, *c1, 1.5 * ts);
+                        draw_bond(fb, *p1, *p2, *c1, *c2, 1.5 * ts, world_per_px);
                     }
                 }
             }
@@ -679,8 +723,9 @@ fn render_wireframe_fb(
                 let p2 = camera.project(a2.x, a2.y, a2.z);
                 let px1 = to_pixel(p1.x, p1.y, p1.z, half_w, half_h);
                 let px2 = to_pixel(p2.x, p2.y, p2.z, half_w, half_h);
-                let color = color_to_rgb(color_scheme.atom_color(a1, res_curr, chain));
-                fb.draw_thick_line_3d(px1, px2, color, 1.5 * ts);
+                let c1 = color_to_rgb(color_scheme.atom_color(a1, res_curr, chain));
+                let c2 = color_to_rgb(color_scheme.atom_color(a2, res_next, chain));
+                draw_bond(fb, px1, px2, c1, c2, 1.5 * ts, world_per_px);
             }
         }
     }
@@ -696,6 +741,8 @@ fn render_ligands_fb(
     half_h: f64,
     ts: f64,
 ) {
+    let sizing = BallAndStick::new(camera, ts);
+    let world_per_px = world_per_pixel(camera);
     for ligand in &protein.ligands {
         match ligand.ligand_type {
             LigandType::Ion => {
@@ -704,7 +751,8 @@ fn render_ligands_fb(
                     let p = camera.project(atom.x, atom.y, atom.z);
                     let px = to_pixel(p.x, p.y, p.z, half_w, half_h);
                     let color = color_to_rgb(color_scheme.ligand_atom_color(atom, ligand));
-                    fb.draw_circle_z(px[0], px[1], px[2], 4.5 * ts, color);
+                    let radius = sizing.ion(&atom.element);
+                    fb.draw_sphere(px[0], px[1], px[2], radius, world_per_px, color);
                 }
             }
             LigandType::Ligand => {
@@ -720,24 +768,17 @@ fn render_ligands_fb(
                     })
                     .collect();
 
-                // Draw atom spheres (radius varies by element)
                 for (atom, px, color) in &projected {
-                    let radius = match atom.element.trim() {
-                        "H" => 1.5,
-                        "C" => 2.5,
-                        "N" | "O" | "S" => 2.8,
-                        "P" => 3.0,
-                        "FE" | "Fe" | "ZN" | "Zn" | "MG" | "Mg" => 3.5,
-                        _ => 2.5,
-                    } * ts;
-                    fb.draw_circle_z(px[0], px[1], px[2], radius, *color);
+                    let radius = sizing.ball(&atom.element);
+                    fb.draw_sphere(px[0], px[1], px[2], radius, world_per_px, *color);
                 }
 
                 // Draw bonds between nearby atoms
+                let stick = sizing.stick();
                 for i in 0..projected.len() {
                     for j in (i + 1)..projected.len() {
                         let (a1, p1, c1) = &projected[i];
-                        let (a2, p2, _) = &projected[j];
+                        let (a2, p2, c2) = &projected[j];
                         if atoms_bonded(
                             &a1.element,
                             a1.x,
@@ -748,7 +789,7 @@ fn render_ligands_fb(
                             a2.y,
                             a2.z,
                         ) {
-                            fb.draw_thick_line_3d(*p1, *p2, *c1, 1.5 * ts);
+                            draw_bond(fb, *p1, *p2, *c1, *c2, stick, world_per_px);
                         }
                     }
                 }
@@ -775,6 +816,9 @@ fn render_selection_fb(
 ) {
     let marker = palette().selection.marker.0;
     let carbon = palette().selection.carbon.0;
+    let sizing = BallAndStick::new(camera, ts);
+    let world_per_px = world_per_pixel(camera);
+    let stick = sizing.stick();
 
     for (chain_index, chain) in protein.chains.iter().enumerate() {
         for (residue_index, residue) in chain.residues.iter().enumerate() {
@@ -797,7 +841,14 @@ fn render_selection_fb(
                     // unbiased marker would be hidden by the very residue it
                     // marks.  Pulling it forward by a ribbon half-width makes
                     // it visible while anything genuinely in front still wins.
-                    fb.draw_circle_z(px[0], px[1], px[2] - MARKER_DEPTH_BIAS, 4.0 * ts, marker);
+                    fb.draw_sphere(
+                        px[0],
+                        px[1],
+                        px[2] - MARKER_DEPTH_BIAS,
+                        4.0 * ts,
+                        world_per_px,
+                        marker,
+                    );
                 }
                 continue;
             }
@@ -813,15 +864,16 @@ fn render_selection_fb(
                 .collect();
 
             for (px, color, atom) in &atoms {
-                fb.draw_circle_z(px[0], px[1], px[2], atom_radius(atom) * ts, *color);
+                let radius = sizing.ball(&atom.element);
+                fb.draw_sphere(px[0], px[1], px[2], radius, world_per_px, *color);
             }
 
             for i in 0..atoms.len() {
                 for j in (i + 1)..atoms.len() {
                     let (p1, c1, a1) = &atoms[i];
-                    let (p2, _, a2) = &atoms[j];
+                    let (p2, c2, a2) = &atoms[j];
                     if atoms_bonded(&a1.element, a1.x, a1.y, a1.z, &a2.element, a2.x, a2.y, a2.z) {
-                        fb.draw_thick_line_3d(*p1, *p2, *c1, 2.0 * ts);
+                        draw_bond(fb, *p1, *p2, *c1, *c2, stick, world_per_px);
                     }
                 }
             }
@@ -837,11 +889,14 @@ fn render_selection_fb(
             if let Some((from, to)) = linking_atoms(chain.molecule_type, residue, next) {
                 let p1 = camera.project(from.x, from.y, from.z);
                 let p2 = camera.project(to.x, to.y, to.z);
-                fb.draw_thick_line_3d(
+                draw_bond(
+                    fb,
                     to_pixel(p1.x, p1.y, p1.z, half_w, half_h),
                     to_pixel(p2.x, p2.y, p2.z, half_w, half_h),
                     selection_atom_color(from, carbon),
-                    2.0 * ts,
+                    selection_atom_color(to, carbon),
+                    stick,
+                    world_per_px,
                 );
             }
         }
@@ -858,14 +913,115 @@ pub(crate) fn selection_atom_color(atom: &Atom, carbon: [u8; 3]) -> [u8; 3] {
     }
 }
 
-/// Sphere radius in framebuffer units before thickness scaling.
-pub(crate) fn atom_radius(atom: &Atom) -> f64 {
-    match atom.element.trim() {
-        "H" => 1.4,
-        "C" => 2.6,
-        "N" | "O" => 2.8,
-        "S" | "P" => 3.2,
-        _ => 3.0,
+/// PyMOL's ball-and-stick preset draws every atom at a quarter of its van der
+/// Waals radius and every bond at one radius regardless of element.  The even
+/// stick weight is what keeps a crowded ligand readable, and sizing balls by
+/// VdW rather than by hand is what makes a sulfur look like a sulfur.
+const BALL_VDW_SCALE: f64 = 0.25;
+
+/// Stick radius in angstroms -- PyMOL's own default for the preset.
+const STICK_RADIUS: f64 = 0.15;
+
+/// Ions are drawn on their own, with no bonds to give them scale, so they take
+/// half their VdW radius: still obviously an atom, not a space-filling blob.
+const ION_VDW_SCALE: f64 = 0.5;
+
+/// Floors below which a ball or a stick stops being a shape and becomes a
+/// speck, in framebuffer pixels scaled by `ts`.
+///
+/// Angstrom-sized radii are what give ball-and-stick its fixed proportions, but
+/// they shrink with the camera: a ligand inside a whole ribosome, or anything
+/// at all in a braille viewport, would land under a pixel.  The ball floor is
+/// still per-element so the sizes stay in proportion to each other when it
+/// bites; a stick has no element to be proportional to, so its floor is flat.
+/// Both are set where the previous hand-tuned pixel sizes were, so nothing gets
+/// smaller than it used to be.
+const MIN_BALL_PX_PER_VDW: f64 = 1.55;
+const MIN_ION_PX_PER_VDW: f64 = 2.2;
+const MIN_STICK_THICKNESS: f64 = 1.6;
+
+/// Ball-and-stick radii for one camera, in framebuffer pixels.
+struct BallAndStick {
+    /// Framebuffer pixels per angstrom.
+    zoom: f64,
+    ts: f64,
+}
+
+impl BallAndStick {
+    fn new(camera: &Camera, ts: f64) -> Self {
+        Self {
+            zoom: if camera.zoom.is_finite() && camera.zoom > 0.0 {
+                camera.zoom
+            } else {
+                0.0
+            },
+            ts,
+        }
+    }
+
+    /// Sphere radius for an atom of a ball-and-stick model.
+    fn ball(&self, element: &str) -> f64 {
+        vdw_radius(element) * (BALL_VDW_SCALE * self.zoom).max(MIN_BALL_PX_PER_VDW * self.ts)
+    }
+
+    /// Sphere radius for a lone ion.
+    fn ion(&self, element: &str) -> f64 {
+        vdw_radius(element) * (ION_VDW_SCALE * self.zoom).max(MIN_ION_PX_PER_VDW * self.ts)
+    }
+
+    /// Bond thickness (diameter), the same for every element.
+    fn stick(&self) -> f64 {
+        (2.0 * STICK_RADIUS * self.zoom).max(MIN_STICK_THICKNESS * self.ts)
+    }
+}
+
+/// Van der Waals radius (Å) for an element symbol.
+///
+/// Bondi (J. Phys. Chem. 1964) with the later Rowland/Taylor and Mantina
+/// revisions, the same set PyMOL ships.  Only the ratios matter here, so
+/// anything unlisted takes a mid-range 1.8 Å rather than a per-element guess.
+fn vdw_radius(element: &str) -> f64 {
+    match element.trim() {
+        "H" | "h" => 1.10,
+        "He" | "HE" | "he" => 1.40,
+        "Li" | "LI" | "li" => 1.81,
+        "Be" | "BE" | "be" => 1.53,
+        "B" | "b" => 1.92,
+        "C" | "c" => 1.70,
+        "N" | "n" => 1.55,
+        "O" | "o" => 1.52,
+        "F" | "f" => 1.47,
+        "Ne" | "NE" | "ne" => 1.54,
+        "Na" | "NA" | "na" => 2.27,
+        "Mg" | "MG" | "mg" => 1.73,
+        "Al" | "AL" | "al" => 1.84,
+        "Si" | "SI" | "si" => 2.10,
+        "P" | "p" => 1.80,
+        "S" | "s" => 1.80,
+        "Cl" | "CL" | "cl" => 1.75,
+        "Ar" | "AR" | "ar" => 1.88,
+        "K" | "k" => 2.75,
+        "Ca" | "CA" | "ca" => 2.31,
+        "Mn" | "MN" | "mn" => 2.05,
+        "Fe" | "FE" | "fe" => 2.04,
+        "Co" | "CO" | "co" => 2.00,
+        "Ni" | "NI" | "ni" => 1.97,
+        "Cu" | "CU" | "cu" => 1.96,
+        "Zn" | "ZN" | "zn" => 2.01,
+        "Se" | "SE" | "se" => 1.90,
+        "Br" | "BR" | "br" => 1.85,
+        "Kr" | "KR" | "kr" => 2.02,
+        "Mo" | "MO" | "mo" => 2.10,
+        "Ag" | "AG" | "ag" => 2.11,
+        "Cd" | "CD" | "cd" => 2.18,
+        "I" | "i" => 1.98,
+        "Xe" | "XE" | "xe" => 2.16,
+        "Pt" | "PT" | "pt" => 2.13,
+        "Au" | "AU" | "au" => 2.14,
+        "Hg" | "HG" | "hg" => 2.09,
+        "Pb" | "PB" | "pb" => 2.02,
+        "U" | "u" => 1.86,
+        _ => 1.80,
     }
 }
 
@@ -930,6 +1086,63 @@ mod tests {
     use super::*;
     use crate::model::protein::{Atom, Chain, MoleculeType, Residue, SecondaryStructure};
     use crate::render::color::ColorSchemeType;
+
+    /// A bond used to be drawn entirely in the first atom's colour, which makes
+    /// a carbonyl look like a carbon bond that stops at an oxygen.  Each half
+    /// now takes its own end's colour.
+    #[test]
+    fn a_bond_takes_both_atom_colours() {
+        let mut fb = Framebuffer::new(60, 40);
+        draw_bond(
+            &mut fb,
+            [10.0, 20.0, 0.0],
+            [50.0, 20.0, 0.0],
+            [255, 0, 0],
+            [0, 255, 0],
+            8.0,
+            0.0,
+        );
+
+        let near = fb.color[20 * 60 + 15];
+        let far = fb.color[20 * 60 + 45];
+        assert!(
+            near[0] > near[1],
+            "the near half should be red, got {near:?}"
+        );
+        assert!(far[1] > far[0], "the far half should be green, got {far:?}");
+    }
+
+    /// Ball-and-stick sizes atoms by van der Waals radius, so the elements come
+    /// out in the order a chemist expects rather than in a hand-written one.
+    #[test]
+    fn balls_are_ordered_by_van_der_waals_radius() {
+        let mut camera = Camera::default();
+        camera.zoom = 20.0;
+        let sizing = BallAndStick::new(&camera, 1.0);
+
+        assert!(sizing.ball("S") > sizing.ball("C"));
+        assert!(sizing.ball("C") > sizing.ball("N"));
+        assert!(sizing.ball("N") > sizing.ball("O"));
+        assert!(sizing.ball("O") > sizing.ball("H"));
+        // A lone ion has no bonds to give it scale, so it is drawn larger.
+        assert!(sizing.ion("FE") > sizing.ball("FE"));
+        // The stick is thinner than the smallest ball it joins.
+        assert!(sizing.stick() < 2.0 * sizing.ball("H"));
+    }
+
+    /// Angstrom-sized radii would vanish once a structure is fitted into a
+    /// small viewport, so the floor takes over -- and it is per-element, so the
+    /// proportions survive it.
+    #[test]
+    fn tiny_zoom_falls_back_to_a_proportional_floor() {
+        let mut camera = Camera::default();
+        camera.zoom = 0.01;
+        let sizing = BallAndStick::new(&camera, 1.0);
+
+        assert!(sizing.ball("C") >= 2.0, "got {}", sizing.ball("C"));
+        assert!(sizing.stick() >= 1.5, "got {}", sizing.stick());
+        assert!(sizing.ball("S") > sizing.ball("C"));
+    }
 
     /// A short CA trace running diagonally across the view.
     fn trace_protein() -> Protein {

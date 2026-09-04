@@ -3,6 +3,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use rayon::prelude::*;
+use std::sync::OnceLock;
 
 /// Depth span, in angstroms, at which the caller's fog strength applies as
 /// given.  Roughly the depth of a small single-domain protein, so structures of
@@ -610,18 +611,30 @@ impl Framebuffer {
         }
     }
 
-    /// Draw a 3D line with the given pixel thickness.
+    /// Draw a bond as a shaded cylinder of the given pixel thickness.
     ///
-    /// For each pixel along the main Bresenham line, a filled circle of the
-    /// given radius (`thickness / 2`) is drawn perpendicular to the line so
-    /// that the resulting stroke has the requested width.  For `thickness`
-    /// values <= 1.0 this falls back to the regular single-pixel `draw_line_3d`.
+    /// The old implementation stamped the same flat colour along a fan of
+    /// half-pixel-offset Bresenham lines.  That has two visible faults: a
+    /// diagonal bond's edges come out combed, because neighbouring offset lines
+    /// land on the same pixel row, and a bar of one constant colour next to
+    /// shaded spheres reads as a flat ribbon rather than a stick.
+    ///
+    /// Rasterizing the bar as an oriented rectangle instead gives every pixel
+    /// an exact position along and across the bond, and across it the surface
+    /// normal sweeps the way a cylinder's cross-section does.  Feeding that
+    /// normal through the same [`shade_sphere`] the atoms use is what makes a
+    /// stick meet a ball without a seam.
+    ///
+    /// `world_per_px` converts the pixel radius into the depth buffer's world
+    /// units; see [`draw_sphere`](Self::draw_sphere).  For `thickness` values
+    /// <= 1.0 this falls back to the single-pixel `draw_line_3d`.
     pub fn draw_thick_line_3d(
         &mut self,
         p1: [f64; 3],
         p2: [f64; 3],
         color: [u8; 3],
         thickness: f64,
+        world_per_px: f64,
     ) {
         if thickness <= 1.0 {
             self.draw_line_3d(p1, p2, color);
@@ -637,32 +650,91 @@ impl Framebuffer {
 
         if len < 1e-6 {
             // Degenerate (zero-length) line – just draw a dot.
-            self.draw_circle_z(p1[0], p1[1], p1[2], half, color);
+            self.draw_sphere(p1[0], p1[1], p1[2], half, world_per_px, color);
             return;
         }
 
-        // Perpendicular unit vector in screen-space.
-        let px = -dy / len;
-        let py = dx / len;
+        // Axis and perpendicular unit vectors in screen space.
+        let ax = dx / len;
+        let ay = dy / len;
+        let ux = -ay;
+        let uy = ax;
 
-        // Draw the line at several perpendicular offsets to fill out the
-        // thickness.  Step size of 0.5 gives smooth coverage.
-        let steps = (half / 0.5).ceil() as isize;
-        for i in -steps..=steps {
-            let offset = i as f64 * 0.5;
-            if offset * offset > half * half {
+        let iy_min = ((p1[1].min(p2[1]) - half).floor() as isize).max(0) as usize;
+        let iy_max = ((p1[1].max(p2[1]) + half).ceil() as isize)
+            .max(0)
+            .min(self.height as isize - 1) as usize;
+        if iy_min > iy_max {
+            return;
+        }
+
+        let inv_half = 1.0 / half;
+        let dz_dt = (p2[2] - p1[2]) / len;
+        let world_radius = half * world_per_px;
+        let light = surface_light();
+        let color = widen(color);
+        let x_last = self.width as f64 - 1.0;
+
+        // Both spans are affine in x with a coefficient that is the same on
+        // every scanline, so the reciprocals -- and the degenerate axis-aligned
+        // cases, where one of the two stops depending on x at all -- come out of
+        // the loop.  A division per scanline costs more than the pixels it saves
+        // on the short bonds that make up most of a structure.
+        let (ux_flat, inv_ux) = (ux.abs() < 1e-12, 1.0 / ux);
+        let (ax_flat, inv_ax) = (ax.abs() < 1e-12, 1.0 / ax);
+
+        for py in iy_min..=iy_max {
+            let fy = py as f64 + 0.5 - p1[1];
+            let cu = fy * uy;
+            let ct = fy * ay;
+            let mut lo = f64::NEG_INFINITY;
+            let mut hi = f64::INFINITY;
+            if ux_flat {
+                if cu.abs() > half {
+                    continue;
+                }
+            } else if !clip_span(inv_ux, -half - cu, half - cu, &mut lo, &mut hi) {
                 continue;
             }
-            let off_p1 = [p1[0] + px * offset, p1[1] + py * offset, p1[2]];
-            let off_p2 = [p2[0] + px * offset, p2[1] + py * offset, p2[2]];
-            self.draw_line_3d(off_p1, off_p2, color);
+            if ax_flat {
+                if ct < 0.0 || ct > len {
+                    continue;
+                }
+            } else if !clip_span(inv_ax, -ct, len - ct, &mut lo, &mut hi) {
+                continue;
+            }
+
+            // `lo`/`hi` bound the pixel *centre* offset from p1, so shift by the
+            // half-pixel before rounding to whole columns.
+            let first = (lo + p1[0] - 0.5).ceil().max(0.0);
+            let last = (hi + p1[0] - 0.5).floor().min(x_last);
+            if first > last {
+                continue;
+            }
+
+            // Position across and along the bar both step by a constant per
+            // pixel, so the span walks them instead of recomputing.
+            let fx = first + 0.5 - p1[0];
+            let mut u = fx * ux + cu;
+            let mut t = fx * ax + ct;
+            for px in (first as usize)..=(last as usize) {
+                // Signed position across the bar, in radii: the cylinder's
+                // normal tips from one limb to the other over this range.
+                let n = u * inv_half;
+                let nz = (1.0 - n * n).max(0.0).sqrt();
+                let z = p1[2] + dz_dt * t - nz * world_radius;
+                let shaded = shade_sphere(ux * n, uy * n, nz, light, color);
+                self.set_pixel(px, py, z as f32, shaded);
+                u += ux;
+                t += ax;
+            }
         }
     }
 
     /// Draw a filled circle at pixel coordinates `(cx, cy)` with the given radius and color.
     #[cfg(test)]
     pub fn draw_circle(&mut self, cx: f64, cy: f64, radius: f64, color: [u8; 3]) {
-        self.draw_circle_z(cx, cy, 0.0, radius, color);
+        self.draw_sphere(cx, cy, 0.0, radius, 0.0, color);
     }
 
     /// Convert this framebuffer's pixel data into an `image::RgbImage`.
@@ -722,12 +794,28 @@ impl Framebuffer {
             .expect("buffer is exactly width * height * 4 bytes")
     }
 
-    /// Draw a filled circle with a specific z-depth for z-buffer testing.
+    /// Draw an atom as a shaded sphere centred at `(cx, cy)` and depth `z`.
     ///
-    /// Pixels at the center of the circle are written at `z`; pixels at the
-    /// edge are also written at `z` (flat disk). For a sphere-like appearance,
-    /// callers can submit multiple concentric circles with varying z.
-    pub fn draw_circle_z(&mut self, cx: f64, cy: f64, z: f64, radius: f64, color: [u8; 3]) {
+    /// Every pixel gets the depth of the sphere's *front surface*, not the
+    /// centre's.  Writing one flat depth made two overlapping atoms sort
+    /// entirely by centre, so their intersection came out as a hard straight
+    /// edge -- a seam no ball-and-stick renderer has -- and the depth fog read
+    /// one distance for the whole disc.  A sphere costs the same square root
+    /// the shading already needed, so the curve is close to free.
+    ///
+    /// `radius` is in pixels but depth is in world units, so `world_per_px`
+    /// (the reciprocal of the camera's zoom) converts between them.  Passing
+    /// zero keeps the old flat disc, which is what a caller with no camera
+    /// wants.
+    pub fn draw_sphere(
+        &mut self,
+        cx: f64,
+        cy: f64,
+        z: f64,
+        radius: f64,
+        world_per_px: f64,
+        color: [u8; 3],
+    ) {
         let ix_min = ((cx - radius).floor() as isize).max(0) as usize;
         let ix_max = ((cx + radius).ceil() as isize)
             .max(0)
@@ -744,7 +832,11 @@ impl Framebuffer {
 
         let r_sq = radius * radius;
         let inv_r = if radius > 0.0 { 1.0 / radius } else { 0.0 };
-        let light = default_light_dir();
+        let inv_r_sq = inv_r * inv_r;
+        let light = surface_light();
+        let color = widen(color);
+        // Depth grows away from the viewer, so the near cap is *subtracted*.
+        let world_radius = radius * world_per_px;
 
         for py in iy_min..=iy_max {
             let dy = py as f64 + 0.5 - cy;
@@ -752,16 +844,33 @@ impl Framebuffer {
             if dy_sq > r_sq {
                 continue;
             }
+            let ny = dy * inv_r;
             for px in ix_min..=ix_max {
                 let dx = px as f64 + 0.5 - cx;
                 let d_sq = dx * dx + dy_sq;
                 if d_sq <= r_sq {
-                    let shaded = shade_sphere(dx * inv_r, dy * inv_r, d_sq / r_sq, light, color);
-                    self.set_pixel(px, py, z as f32, shaded);
+                    let nz = (1.0 - d_sq * inv_r_sq).max(0.0).sqrt();
+                    let shaded = shade_sphere(dx * inv_r, ny, nz, light, color);
+                    self.set_pixel(px, py, (z - nz * world_radius) as f32, shaded);
                 }
             }
         }
     }
+}
+
+/// Narrow `[lo, hi]` to the values of `x` that satisfy `min <= x / inv_coef <=
+/// max`, given the reciprocal of the coefficient rather than the coefficient.
+///
+/// Returns false once the interval is empty, which lets a scanline bail before
+/// it looks at a single pixel.  The caller must have ruled out a zero
+/// coefficient, where the constraint stops depending on `x` at all.
+#[inline]
+fn clip_span(inv_coef: f64, min: f64, max: f64, lo: &mut f64, hi: &mut f64) -> bool {
+    let (a, b) = (min * inv_coef, max * inv_coef);
+    let (a, b) = if a <= b { (a, b) } else { (b, a) };
+    *lo = lo.max(a);
+    *hi = hi.min(b);
+    *lo <= *hi
 }
 
 /// Quantize a single color channel by rounding to the nearest multiple of
@@ -1154,7 +1263,52 @@ pub fn normalize(v: [f64; 3]) -> [f64; 3] {
 /// replaces once depth fog was applied on top.
 const SPHERE_AMBIENT: f64 = 0.50;
 
-/// Shade one pixel of an atom as a point on a sphere rather than a flat disc.
+/// Weight of the specular highlight, as a fraction of full white.
+///
+/// A diffuse-only ball reads as matte plastic; the small bright spot is most of
+/// what makes a molecular viewer's atoms look like the glossy spheres people
+/// recognise.  Kept well under half so it reads as a highlight on the atom's
+/// own colour rather than bleaching a hole in it.
+const SPHERE_SPECULAR: f64 = 0.30;
+
+/// The ambient floor and the half-Lambert wrap, folded into the slope and
+/// intercept of a single multiply-add: `intensity = slope * dot + base`.
+const SPHERE_WRAP_SLOPE: f64 = (1.0 - SPHERE_AMBIENT) * 0.5;
+const SPHERE_WRAP_BASE: f64 = SPHERE_AMBIENT + (1.0 - SPHERE_AMBIENT) * 0.5;
+
+/// Directions needed to shade a curved surface, resolved once per primitive.
+///
+/// The Blinn-Phong halfway vector is a normalize away from the light, and a
+/// primitive covers hundreds of pixels; computing it per pixel would double the
+/// square roots in the inner loop for a value that never changes.
+#[derive(Clone, Copy)]
+pub struct SurfaceLight {
+    dir: [f64; 3],
+    half: [f64; 3],
+}
+
+impl SurfaceLight {
+    /// `dir` points toward the light in a y-up view space with +z toward the
+    /// viewer, which is where [`default_light_dir`] lives.
+    fn new(dir: [f64; 3]) -> Self {
+        // The viewer sits at +z in this space, so the halfway vector is the
+        // light nudged one unit toward the camera.
+        let half = normalize([dir[0], dir[1], dir[2] + 1.0]);
+        Self { dir, half }
+    }
+}
+
+/// The scene light, resolved once for the life of the process.
+///
+/// Every sphere and every stick wants the same two unit vectors, and a large
+/// structure submits tens of thousands of primitives per frame; two square
+/// roots apiece is pure overhead against a value that never changes.
+fn surface_light() -> SurfaceLight {
+    static LIGHT: OnceLock<SurfaceLight> = OnceLock::new();
+    *LIGHT.get_or_init(|| SurfaceLight::new(default_light_dir()))
+}
+
+/// Shade one pixel of a curved surface -- a sphere's cap or a cylinder's flank.
 ///
 /// Backbone and ligand atoms are drawn as filled circles of one flat colour.
 /// On a small structure that is fine, but a large one is tens of thousands of
@@ -1164,29 +1318,48 @@ const SPHERE_AMBIENT: f64 = 0.50;
 /// square root per pixel and gives every atom a highlight and a shaded limb,
 /// which is what makes a dense structure legible.
 ///
-/// `nx`/`ny` are the pixel's offset from the centre in radii, and `d_sq_norm`
-/// is that offset's squared length, so the surface normal follows from the
-/// sphere equation.  Screen y runs downward while the light is specified in a
-/// y-up view space, hence the flip.
+/// `nx`/`ny`/`nz` are the unit surface normal at this pixel.  Screen y runs
+/// downward while the light is specified in a y-up view space, hence the flip;
+/// `nz` is the viewer-facing component and is positive on everything the
+/// caller can see.  `color` arrives already widened because the caller has one
+/// colour for the whole primitive and this runs once per pixel.
 #[inline]
-fn shade_sphere(nx: f64, ny: f64, d_sq_norm: f64, light: [f64; 3], color: [u8; 3]) -> [u8; 3] {
+fn shade_sphere(nx: f64, ny: f64, nz: f64, light: SurfaceLight, color: [f64; 3]) -> [u8; 3] {
     // The z axis here is the light's own, not the depth buffer's: `light` has a
     // positive z and is meant to sit in front of the scene, so the face of the
     // sphere pointing at the viewer takes +z and catches the highlight.  The
     // triangle rasterizer never had to pick a side because it shades with
     // `abs(dot)`; a sphere does, or the highlight lands on the wrong limb.
-    let nz = (1.0 - d_sq_norm).max(0.0).sqrt();
-    // Screen y runs downward while the light is given in a y-up view space.
-    let dot = nx * light[0] - ny * light[1] + nz * light[2];
+    let dot = nx * light.dir[0] - ny * light.dir[1] + nz * light.dir[2];
     // Half-Lambert wrap, as the triangle rasterizer uses: it keeps the unlit
     // limb from going flat black, which matters when atoms are only a few
-    // pixels across and a hard terminator would just read as noise.
-    let wrapped = dot.mul_add(0.5, 0.5);
-    let intensity = SPHERE_AMBIENT + (1.0 - SPHERE_AMBIENT) * wrapped;
+    // pixels across and a hard terminator would just read as noise.  Ambient
+    // and wrap are folded into one multiply-add; see the two constants.
+    let intensity = dot.mul_add(SPHERE_WRAP_SLOPE, SPHERE_WRAP_BASE);
+
+    // Blinn-Phong, raised to 32 by repeated squaring rather than `powf` -- five
+    // multiplies against a transcendental call, on the hottest loop there is.
+    let spec_dot = (nx * light.half[0] - ny * light.half[1] + nz * light.half[2]).max(0.0);
+    let s2 = spec_dot * spec_dot;
+    let s4 = s2 * s2;
+    let s8 = s4 * s4;
+    let s16 = s8 * s8;
+    let spec = s16 * s16 * (SPHERE_SPECULAR * 255.0);
+
     [
-        (f64::from(color[0]) * intensity).min(255.0) as u8,
-        (f64::from(color[1]) * intensity).min(255.0) as u8,
-        (f64::from(color[2]) * intensity).min(255.0) as u8,
+        color[0].mul_add(intensity, spec).min(255.0) as u8,
+        color[1].mul_add(intensity, spec).min(255.0) as u8,
+        color[2].mul_add(intensity, spec).min(255.0) as u8,
+    ]
+}
+
+/// Widen a primitive's colour once, outside the per-pixel loop.
+#[inline]
+fn widen(color: [u8; 3]) -> [f64; 3] {
+    [
+        f64::from(color[0]),
+        f64::from(color[1]),
+        f64::from(color[2]),
     ]
 }
 
@@ -1391,6 +1564,163 @@ mod tests {
             toward_light >= centre && centre >= away_from_light,
             "brightness should fall off across the sphere: {toward_light} / {centre} / {away_from_light}"
         );
+    }
+
+    /// The depth written for an atom is the depth of its front surface, so the
+    /// buffer bulges a full world radius toward the viewer at the centre and
+    /// falls back to the atom's own depth at the silhouette.
+    #[test]
+    fn sphere_depth_bulges_toward_the_viewer() {
+        let mut fb = Framebuffer::new(40, 40);
+        // 10 pixels of radius at 0.1 world units per pixel: a 1 A atom.
+        fb.draw_sphere(20.0, 20.0, 5.0, 10.0, 0.1, [200, 200, 200]);
+
+        let at = |x: usize, y: usize| fb.depth[y * 40 + x];
+        assert!(
+            (at(20, 20) - 4.0).abs() < 0.05,
+            "centre should sit a world radius in front of 5.0, got {}",
+            at(20, 20)
+        );
+        // The bulge falls away toward the silhouette, where it reaches the
+        // atom's own depth.
+        assert!(
+            at(20, 20) < at(25, 20) && at(25, 20) < at(29, 20) && at(29, 20) < 5.0,
+            "depth should rise toward the limb: {} / {} / {}",
+            at(20, 20),
+            at(25, 20),
+            at(29, 20)
+        );
+    }
+
+    /// Two atoms used to sort entirely by centre depth, so the further one was
+    /// rejected across the whole of the nearer one's disc and their overlap came
+    /// out as a hard straight edge.  With per-pixel depth the further atom wins
+    /// wherever its own surface genuinely bulges in front.
+    #[test]
+    fn a_further_atom_shows_where_its_surface_comes_forward() {
+        let render = |world_per_px: f64| {
+            let mut fb = Framebuffer::new(80, 60);
+            fb.draw_sphere(25.0, 30.0, 0.0, 20.0, world_per_px, [255, 0, 0]);
+            fb.draw_sphere(35.0, 30.0, 0.3, 20.0, world_per_px, [0, 255, 0]);
+            fb.color[30 * 80 + 42]
+        };
+
+        // (42, 30) is well inside the near atom's disc.
+        let flat = render(0.0);
+        assert!(
+            flat[0] > flat[1],
+            "with one depth per disc the further atom must lose outright, got {flat:?}"
+        );
+        let curved = render(1.0 / 20.0);
+        assert!(
+            curved[1] > curved[0],
+            "the further atom's surface is in front here, so it should win, got {curved:?}"
+        );
+    }
+
+    /// A bond is a cylinder, not a flat bar: across its width the normal sweeps
+    /// from one limb to the other, so the lit side, the crown and the far limb
+    /// all differ.
+    #[test]
+    fn a_stick_is_shaded_across_its_width() {
+        let mut fb = Framebuffer::new(60, 40);
+        fb.draw_thick_line_3d(
+            [10.0, 20.0, 0.0],
+            [50.0, 20.0, 0.0],
+            [200, 200, 200],
+            11.0,
+            0.0,
+        );
+
+        let at = |y: usize| fb.color[y * 60 + 30][0];
+        // Screen y runs downward and the light sits above, so the upper limb is
+        // the lit one.
+        let (lit, crown, far) = (at(16), at(20), at(24));
+        assert!(
+            lit > crown && crown > far,
+            "brightness should fall across the bar: {lit} / {crown} / {far}"
+        );
+    }
+
+    /// A stick's depth follows the cylinder too, so a bond meets the atoms at
+    /// its ends without a step in the depth buffer.
+    #[test]
+    fn stick_depth_bulges_along_its_crown() {
+        let mut fb = Framebuffer::new(60, 40);
+        fb.draw_thick_line_3d(
+            [10.0, 20.0, 4.0],
+            [50.0, 20.0, 4.0],
+            [200, 200, 200],
+            10.0,
+            0.1,
+        );
+
+        let at = |y: usize| fb.depth[y * 60 + 30];
+        assert!(
+            (at(20) - 3.5).abs() < 0.1,
+            "crown should sit a world radius in front of 4.0, got {}",
+            at(20)
+        );
+        assert!(
+            at(20) < at(23),
+            "the crown {} should be nearer than the limb {}",
+            at(20),
+            at(23)
+        );
+    }
+
+    /// The old thick line stamped a fan of half-pixel-offset Bresenham lines,
+    /// which left a combed edge on any diagonal.  An oriented-rectangle
+    /// rasterizer covers every scanline it touches in one unbroken run.
+    #[test]
+    fn a_diagonal_stick_has_no_holes() {
+        let mut fb = Framebuffer::new(60, 60);
+        fb.draw_thick_line_3d(
+            [10.0, 12.0, 0.0],
+            [48.0, 46.0, 0.0],
+            [200, 200, 200],
+            7.0,
+            0.0,
+        );
+
+        let mut rows = 0;
+        for y in 0..60 {
+            let lit: Vec<usize> = (0..60)
+                .filter(|&x| fb.color[y * 60 + x] != [0, 0, 0])
+                .collect();
+            if lit.is_empty() {
+                continue;
+            }
+            rows += 1;
+            assert_eq!(
+                lit.last().unwrap() - lit[0] + 1,
+                lit.len(),
+                "row {y} has a gap: {lit:?}"
+            );
+        }
+        assert!(
+            rows > 30,
+            "the stick should span most of the frame, got {rows}"
+        );
+    }
+
+    /// The span solver is what decides which pixels a stick covers, so its
+    /// interval arithmetic is worth pinning down on its own.
+    #[test]
+    fn clip_span_intersects_intervals() {
+        let (mut lo, mut hi) = (f64::NEG_INFINITY, f64::INFINITY);
+        // 2 <= 2x <= 8  ->  x in [1, 4]
+        assert!(clip_span(0.5, 2.0, 8.0, &mut lo, &mut hi));
+        assert!((lo - 1.0).abs() < 1e-9 && (hi - 4.0).abs() < 1e-9);
+
+        // A negative coefficient flips the interval rather than emptying it.
+        let (mut lo, mut hi) = (f64::NEG_INFINITY, f64::INFINITY);
+        assert!(clip_span(-0.5, 2.0, 8.0, &mut lo, &mut hi));
+        assert!((lo + 4.0).abs() < 1e-9 && (hi + 1.0).abs() < 1e-9);
+
+        // Disjoint constraints leave nothing.
+        let (mut lo, mut hi) = (0.0, 1.0);
+        assert!(!clip_span(1.0, 5.0, 9.0, &mut lo, &mut hi));
     }
 
     #[test]
