@@ -11,9 +11,72 @@ const FOG_REFERENCE_DEPTH: f64 = 55.0;
 
 /// Ceiling on the depth-scaled fog strength.
 ///
-/// At this blend a distant feature keeps a quarter of its own color: clearly
-/// receded, still identifiable.  Reached at roughly twice the reference depth.
-const FOG_MAX_STRENGTH: f64 = 0.75;
+/// At this blend a distant feature keeps a sixth of its own color: it has to
+/// drop far enough to stop competing with the front of a ribosome, but the fog
+/// color is well above the terminal background, so it never disappears.
+const FOG_MAX_STRENGTH: f64 = 0.85;
+
+/// Curvature of the fog ramp, in multiples of `ln(depth span / reference depth)`.
+///
+/// This is the knob that decides how much of a very deep structure's contrast
+/// budget goes to the front.  At 2.0 the ramp's e-folding distance lands
+/// between 75 and 120 A for every span from 1.5x to 10x the reference depth,
+/// so the fog behaves like real distance fog with a fixed absolute scale
+/// length while still collapsing to the old linear ramp at the reference
+/// depth.  Higher gains read as a spotlit front shell with the rest of the
+/// structure in shadow, which loses the overall silhouette.
+const FOG_CURVE_GAIN: f64 = 2.0;
+
+/// Chroma removed at the far plane once the structure is much deeper than the
+/// reference depth.
+///
+/// Luminance alone is a weak cue in a densely overlapped backbone render: the
+/// chain palette is saturated enough that a half-strength blend toward a dark
+/// tint still reads as vivid green or magenta.  Draining the chroma as well
+/// separates near from far even where the two are interleaved pixel by pixel.
+const FOG_MAX_DESATURATION: f64 = 1.0;
+
+/// Entries in the per-frame fog ramp table.
+///
+/// The ramp needs an `exp` per pixel, which at 4 MP costs more than the rest
+/// of the pass put together.  Tabulating it quantizes the blend to under
+/// 1/1000, well inside one 8-bit color step.
+const FOG_RAMP_STEPS: usize = 1024;
+
+/// Fog one pixel: drain its chroma, then blend it toward the fog colour.
+///
+/// Draining first is what makes the two cues add rather than cancel.  Blending
+/// a saturated colour toward a dark blue-gray shifts its hue as much as its
+/// brightness, so a distant magenta arrives somewhere near the fog's own hue
+/// while still looking like a colour; pulling it toward its own grey first
+/// means what the fog then tints is already neutral, and the pixel reads as
+/// "further away" rather than "differently coloured".
+///
+/// f32 throughout, and the chroma drain is skipped when it is off: this runs
+/// once per drawn pixel of every frame, where a shallow structure's ramp never
+/// desaturates at all and would otherwise pay for a luma it does not use.
+#[inline]
+fn blend_fog(c: &mut [u8; 3], fog_color: [u8; 3], blend: f32, desaturation: f32) {
+    if desaturation <= 0.0 {
+        for (channel, &fog) in c.iter_mut().zip(fog_color.iter()) {
+            let own = f32::from(*channel);
+            *channel = own.mul_add(1.0 - blend, f32::from(fog) * blend) as u8;
+        }
+        return;
+    }
+
+    // Rec. 601 luma. Cheap, and close enough to perceived brightness that a
+    // fully drained pixel keeps the weight it had against its neighbours.
+    let luma = 0.299f32.mul_add(
+        f32::from(c[0]),
+        0.587f32.mul_add(f32::from(c[1]), 0.114 * f32::from(c[2])),
+    );
+    for (channel, &fog) in c.iter_mut().zip(fog_color.iter()) {
+        let own = f32::from(*channel);
+        let drained = (luma - own).mul_add(desaturation, own);
+        *channel = (f32::from(fog) - drained).mul_add(blend, drained) as u8;
+    }
+}
 
 /// RGB pixel framebuffer with z-buffer for software rasterization.
 ///
@@ -190,7 +253,7 @@ impl Framebuffer {
     /// - The `fog_strength` parameter (0.0..=1.0) sets the blend at the far
     ///   plane for a structure no deeper than [`FOG_REFERENCE_DEPTH`]
     ///
-    /// # Why the strength scales with depth
+    /// # Why the ramp bends for deep structures
     ///
     /// The ramp is normalized across the structure's own depth range, so the
     /// contrast between two features a fixed distance apart is inversely
@@ -199,10 +262,24 @@ impl Framebuffer {
     /// in a ribosome -- invisible, which is exactly when depth cues matter
     /// most, because that is when everything overlaps.
     ///
-    /// Scaling the strength with the depth span restores roughly constant
-    /// discrimination per angstrom, up to [`FOG_MAX_STRENGTH`], which bounds
-    /// how much of a distant feature's own color is allowed to wash out.
-    /// Structures at or below the reference depth are unaffected.
+    /// Raising the far-plane strength alone does not fix that: it spreads the
+    /// extra contrast evenly over a 227 A span, and 8XT3 still renders as flat
+    /// confetti.  What the eye needs is contrast where the geometry is, and in
+    /// a dense structure viewed head-on most visible pixels sit in the front
+    /// half (median depth 0.32 of the span for 8XT3, because the back is only
+    /// glimpsed through gaps).  Bending the ramp exponentially concentrates
+    /// the budget there, in the same way real distance fog does, at the cost
+    /// of flattening the far end that was barely readable anyway.
+    ///
+    /// Luminance is also not enough on its own.  Against a saturated chain
+    /// palette a 0.4 blend toward a dark blue-gray still reads as vivid green,
+    /// so the ramp drains chroma as well ([`FOG_MAX_DESATURATION`]); that is
+    /// the cue that survives when near and far material interleaves pixel by
+    /// pixel.
+    ///
+    /// All three terms -- strength, curvature and desaturation -- are keyed to
+    /// the span/reference ratio and vanish together at it, so structures at or
+    /// below the reference depth keep exactly the appearance they always had.
     pub fn apply_depth_tint(&mut self, fog_color: [u8; 3], fog_strength: f64) {
         // Find z_min and z_max across all valid (non-background) pixels.
         let (z_min, z_max) = self
@@ -231,6 +308,39 @@ impl Framebuffer {
             .clamp(fog_strength, FOG_MAX_STRENGTH);
 
         let inv_range = 1.0 / z_range;
+        let span_ratio = f64::from(z_range) / FOG_REFERENCE_DEPTH;
+
+        // Small structures take the straight ramp, untouched and untabulated,
+        // so their frames stay bit-for-bit what they were.
+        if span_ratio <= 1.0 {
+            self.color
+                .par_iter_mut()
+                .zip(self.depth.par_iter())
+                .for_each(|(c, &d)| {
+                    if d >= f32::INFINITY {
+                        return; // background pixel — leave black
+                    }
+                    let t = ((d - z_min) * inv_range).clamp(0.0, 1.0);
+                    blend_fog(c, fog_color, t * strength as f32, 0.0);
+                });
+            return;
+        }
+
+        let curvature = FOG_CURVE_GAIN * span_ratio.ln();
+        let curve_norm = 1.0 / (1.0 - (-curvature).exp());
+        // Ties the chroma drain to the same ratio as the other two terms, so a
+        // structure that only just clears the reference depth barely changes.
+        let desaturation = FOG_MAX_DESATURATION * (1.0 - 1.0 / span_ratio);
+
+        let mut blend_ramp = [0.0f32; FOG_RAMP_STEPS];
+        let mut desat_ramp = [0.0f32; FOG_RAMP_STEPS];
+        for (i, (blend, desat)) in blend_ramp.iter_mut().zip(desat_ramp.iter_mut()).enumerate() {
+            let t = i as f64 / (FOG_RAMP_STEPS - 1) as f64;
+            let fraction = (1.0 - (-curvature * t).exp()) * curve_norm;
+            *blend = (fraction * strength) as f32;
+            *desat = (fraction * desaturation) as f32;
+        }
+        let last_step = (FOG_RAMP_STEPS - 1) as f32;
 
         // Per-pixel and independent -- parallelize over rows.
         self.color
@@ -241,13 +351,8 @@ impl Framebuffer {
                     return; // background pixel — leave black
                 }
                 let t = ((d - z_min) * inv_range).clamp(0.0, 1.0);
-                let blend = t as f64 * strength;
-                c[0] = (c[0] as f64 + (fog_color[0] as f64 - c[0] as f64) * blend).clamp(0.0, 255.0)
-                    as u8;
-                c[1] = (c[1] as f64 + (fog_color[1] as f64 - c[1] as f64) * blend).clamp(0.0, 255.0)
-                    as u8;
-                c[2] = (c[2] as f64 + (fog_color[2] as f64 - c[2] as f64) * blend).clamp(0.0, 255.0)
-                    as u8;
+                let step = ((t * last_step) as usize).min(FOG_RAMP_STEPS - 1);
+                blend_fog(c, fog_color, blend_ramp[step], desat_ramp[step]);
             });
     }
 
@@ -1164,6 +1269,87 @@ mod tests {
         // Diagonal line should touch (0,0) and (9,9)
         assert_eq!(fb.color[0], [255, 255, 255]);
         assert_eq!(fb.color[9 * 10 + 9], [255, 255, 255]);
+    }
+
+    /// Build a framebuffer whose drawn pixels span `depth` angstroms.
+    fn fb_with_depth_span(depth: f32) -> Framebuffer {
+        let mut fb = Framebuffer::new(16, 1);
+        for (i, (c, d)) in fb.color.iter_mut().zip(fb.depth.iter_mut()).enumerate() {
+            *c = [200, 40, 160];
+            *d = i as f32 / 15.0 * depth;
+        }
+        fb
+    }
+
+    /// A structure no deeper than the reference keeps exactly the flat ramp it
+    /// always had: no curvature, no chroma drain.
+    #[test]
+    fn shallow_structures_keep_the_linear_ramp() {
+        let span = FOG_REFERENCE_DEPTH as f32 * 0.9;
+        let mut fb = fb_with_depth_span(span);
+        fb.apply_depth_tint([40, 50, 70], 0.35);
+
+        let fog = [40.0, 50.0, 70.0];
+        let base = [200.0, 40.0, 160.0];
+        for (i, c) in fb.color.iter().enumerate() {
+            let blend = (i as f64 / 15.0) * 0.35;
+            for ch in 0..3 {
+                let want = (base[ch] + (fog[ch] - base[ch]) * blend).round() as i32;
+                assert!(
+                    (i32::from(c[ch]) - want).abs() <= 1,
+                    "pixel {i} channel {ch}: got {} want ~{want}",
+                    c[ch]
+                );
+            }
+        }
+    }
+
+    /// The nearest pixel is never fogged, however deep the structure.
+    #[test]
+    fn the_nearest_pixel_keeps_its_colour() {
+        for span in [30.0, 227.0] {
+            let mut fb = fb_with_depth_span(span);
+            fb.apply_depth_tint([40, 50, 70], 0.35);
+            assert_eq!(fb.color[0], [200, 40, 160], "span {span}");
+        }
+    }
+
+    /// A ribosome-deep structure must both darken and desaturate its far side,
+    /// and reach further toward the fog colour than a shallow one does.
+    #[test]
+    fn deep_structures_drain_colour_with_distance() {
+        let chroma = |c: [u8; 3]| {
+            let hi = c.iter().max().copied().unwrap_or(0) as i32;
+            let lo = c.iter().min().copied().unwrap_or(0) as i32;
+            hi - lo
+        };
+
+        let mut shallow = fb_with_depth_span(FOG_REFERENCE_DEPTH as f32 * 0.9);
+        shallow.apply_depth_tint([40, 50, 70], 0.35);
+        let mut deep = fb_with_depth_span(227.0);
+        deep.apply_depth_tint([40, 50, 70], 0.35);
+
+        let far_shallow = *shallow.color.last().unwrap();
+        let far_deep = *deep.color.last().unwrap();
+
+        assert!(
+            chroma(far_deep) < chroma(far_shallow),
+            "deep far plane should lose chroma: {far_deep:?} vs {far_shallow:?}"
+        );
+        // Front half must stay clearly more vivid than the back.
+        let near_deep = deep.color[2];
+        assert!(
+            chroma(near_deep) > chroma(far_deep) * 2,
+            "front should stay vivid against the back: {near_deep:?} vs {far_deep:?}"
+        );
+    }
+
+    /// With the drain off, fogging is a plain lerp toward the fog colour.
+    #[test]
+    fn blend_fog_without_desaturation_is_a_plain_lerp() {
+        let mut c = [200, 40, 160];
+        blend_fog(&mut c, [40, 50, 70], 0.5, 0.0);
+        assert_eq!(c, [120, 45, 115]);
     }
 
     #[test]
