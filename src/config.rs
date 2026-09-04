@@ -12,7 +12,8 @@
 //! renderer.  Call [`init`] once from `main`; everything else reads [`config`]
 //! or, for the common case, [`palette`].
 //!
-//! Procedural schemes (Rainbow's HSV sweep) are not covered here yet.
+//! Everything ProteinView draws in a fixed color is reachable from here,
+//! including the Rainbow scheme's ramp and the background behind the structure.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -449,6 +450,13 @@ pub struct Palette {
     pub interface: InterfacePalette,
     pub ligand: LigandPalette,
     pub selection: SelectionPalette,
+    /// Color stops for the Rainbow scheme, N-terminus first, interpolated
+    /// across the chain.  `None` keeps the built-in HSV sweep.
+    pub rainbow: Option<Vec<Rgb>>,
+    /// What empty space is painted with.  `None` leaves it transparent, so the
+    /// terminal's own background shows through and a snapshot PNG keeps its
+    /// alpha -- which is the behaviour every version so far has had.
+    pub background: Option<Rgb>,
 }
 
 impl Default for Palette {
@@ -472,16 +480,50 @@ impl Default for Palette {
             interface: InterfacePalette::default(),
             ligand: LigandPalette::default(),
             selection: SelectionPalette::default(),
+            rainbow: None,
+            background: None,
         }
     }
 }
 
 impl Palette {
+    /// The Rainbow scheme's color at `t`, where 0.0 is the N-terminus and 1.0
+    /// the C-terminus, or `None` when no ramp is configured and the caller
+    /// should fall back to the built-in HSV sweep.
+    ///
+    /// Stops are spread evenly and blended between, so eight colors give seven
+    /// gradients rather than eight bands: a ramp, like the sweep it replaces.
+    pub fn rainbow_at(&self, t: f64) -> Option<Rgb> {
+        let stops = self.rainbow.as_ref()?;
+        let t = t.clamp(0.0, 1.0);
+        match stops.len() {
+            0 => None,
+            1 => Some(stops[0]),
+            n => {
+                let scaled = t * (n - 1) as f64;
+                let lower = (scaled.floor() as usize).min(n - 2);
+                let frac = scaled - lower as f64;
+                let (a, b) = (stops[lower].0, stops[lower + 1].0);
+                Some(Rgb([
+                    lerp_channel(a[0], b[0], frac),
+                    lerp_channel(a[1], b[1], frac),
+                    lerp_channel(a[2], b[2], frac),
+                ]))
+            }
+        }
+    }
+
     /// Color for the chain whose id starts with `id`, cycling through `chains`.
     pub fn chain(&self, id: &str) -> Rgb {
         let idx = id.bytes().next().unwrap_or(b'A') as usize % self.chains.len();
         self.chains[idx]
     }
+}
+
+/// Blend one channel, rounding rather than truncating so a ramp's midpoint is
+/// the midpoint.
+fn lerp_channel(a: u8, b: u8, t: f64) -> u8 {
+    (f64::from(a) + (f64::from(b) - f64::from(a)) * t).round() as u8
 }
 
 // ---------------------------------------------------------------------------
@@ -552,6 +594,24 @@ struct ChainFile {
     colors: Option<Vec<Rgb>>,
 }
 
+/// Rainbow section.  A section for the same reason `chain` is one, and because
+/// a ramp is a list rather than a single color.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RainbowFile {
+    /// Stops from the N-terminus to the C-terminus, blended between.  Replaces
+    /// the built-in HSV sweep outright.
+    colors: Option<Vec<Rgb>>,
+}
+
+/// Background section.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct BackgroundFile {
+    /// Paints empty space.  Omitted, it stays transparent.
+    color: Option<Rgb>,
+}
+
 /// One palette's worth of color sections.
 ///
 /// The top level of the file is one of these, and so is every `[[palette]]`
@@ -572,6 +632,8 @@ struct PaletteFile {
     interface: InterfacePalette,
     ligand: LigandPalette,
     selection: SelectionPalette,
+    rainbow: RainbowFile,
+    background: BackgroundFile,
 }
 
 impl PaletteFile {
@@ -593,8 +655,16 @@ impl PaletteFile {
             interface: self.interface,
             ligand: self.ligand,
             selection: self.selection,
+            rainbow: None,
+            background: self.background.color,
         };
 
+        if let Some(colors) = self.rainbow.colors {
+            if colors.is_empty() {
+                anyhow::bail!("`{where_}rainbow.colors` must list at least one color");
+            }
+            palette.rainbow = Some(colors);
+        }
         if let Some(colors) = self.chain.colors {
             if colors.is_empty() {
                 anyhow::bail!("`{where_}chain.colors` must list at least one color");
@@ -636,6 +706,8 @@ struct ConfigFile {
     interface: InterfacePalette,
     ligand: LigandPalette,
     selection: SelectionPalette,
+    rainbow: RainbowFile,
+    background: BackgroundFile,
     fog: Fog,
     defaults: Defaults,
     /// Additional named palettes, as an array of tables so the cycling order is
@@ -656,6 +728,8 @@ impl ConfigFile {
             interface: self.interface,
             ligand: self.ligand,
             selection: self.selection,
+            rainbow: self.rainbow,
+            background: self.background,
         };
 
         let mut palettes = vec![NamedPalette {
@@ -1186,6 +1260,90 @@ mod tests {
             "back off the start wraps to the end"
         );
         assert_eq!(next_index(0, 1, true), 0, "a lone palette cycles to itself");
+    }
+
+    #[test]
+    fn a_rainbow_ramp_blends_between_its_stops() {
+        let p = parse_palette(
+            r#"
+            [rainbow]
+            colors = ["000000", "FFFFFF"]
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(p.rainbow_at(0.0), Some(Rgb::new(0, 0, 0)));
+        assert_eq!(p.rainbow_at(1.0), Some(Rgb::new(255, 255, 255)));
+        // Halfway is halfway, rounded rather than truncated.
+        assert_eq!(p.rainbow_at(0.5), Some(Rgb::new(128, 128, 128)));
+    }
+
+    #[test]
+    fn a_ramp_of_many_stops_hits_each_one_in_order() {
+        // Eight stops make seven gradients, and every stop is reached exactly.
+        let p = parse_palette(
+            r#"
+            [rainbow]
+            colors = ["A3E8C7", "8EDBD8", "8FCBF3", "A5B4F5",
+                      "C5A9F0", "E5A3E0", "F5A7C0", "F7C9A0"]
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(p.rainbow_at(0.0), Some(Rgb::new(0xA3, 0xE8, 0xC7)));
+        assert_eq!(p.rainbow_at(1.0), Some(Rgb::new(0xF7, 0xC9, 0xA0)));
+        for (i, want) in [
+            (0, Rgb::new(0xA3, 0xE8, 0xC7)),
+            (3, Rgb::new(0xA5, 0xB4, 0xF5)),
+            (7, Rgb::new(0xF7, 0xC9, 0xA0)),
+        ] {
+            let t = i as f64 / 7.0;
+            assert_eq!(p.rainbow_at(t), Some(want), "stop {i} at t={t}");
+        }
+    }
+
+    #[test]
+    fn no_ramp_means_the_built_in_sweep() {
+        assert_eq!(parse_palette("").unwrap().rainbow_at(0.5), None);
+        let err = parse("[rainbow]\ncolors = []").unwrap_err().to_string();
+        assert!(err.contains("at least one"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn a_background_is_off_unless_configured() {
+        assert_eq!(parse_palette("").unwrap().background, None);
+        assert_eq!(
+            parse_palette("[background]\ncolor = \"1a1b26\"")
+                .unwrap()
+                .background,
+            Some(Rgb::new(0x1A, 0x1B, 0x26))
+        );
+    }
+
+    #[test]
+    fn a_named_palette_can_carry_its_own_ramp_and_background() {
+        // The whole point of a themed palette: switch to it and the background
+        // and the rainbow move with it.
+        let c = parse(
+            r##"
+            [[palette]]
+            name = "aurora"
+
+            [palette.background]
+            color = "#1a1b26"
+
+            [palette.rainbow]
+            colors = ["A3E8C7", "F7C9A0"]
+            "##,
+        )
+        .unwrap();
+
+        let aurora = &c.palettes[1].palette;
+        assert_eq!(aurora.background, Some(Rgb::new(0x1A, 0x1B, 0x26)));
+        assert_eq!(aurora.rainbow_at(0.0), Some(Rgb::new(0xA3, 0xE8, 0xC7)));
+        // And the default palette is untouched by it.
+        assert_eq!(c.palettes[0].palette.background, None);
+        assert_eq!(c.palettes[0].palette.rainbow_at(0.0), None);
     }
 
     #[test]

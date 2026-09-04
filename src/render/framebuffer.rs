@@ -5,7 +5,16 @@ use ratatui::widgets::Paragraph;
 use rayon::prelude::*;
 use std::sync::OnceLock;
 
-use crate::config::Fog;
+use crate::config::{Fog, palette};
+
+/// The palette's background color, if it configures one.
+///
+/// Read at conversion time rather than baked into the framebuffer: the
+/// rasterizer's coverage test is "this pixel is not black", so painting the
+/// background in would make every empty pixel look drawn.
+fn background_color() -> Option<[u8; 3]> {
+    palette().background.map(|rgb| rgb.0)
+}
 
 /// The fog's own parameters -- reference depth, ceiling, curvature and chroma
 /// drain -- live on [`Fog`], where the config file can reach them.  The defaults
@@ -722,11 +731,19 @@ impl Framebuffer {
     /// with each pixel's RGB channels copied directly.  This is used by the
     /// ratatui-image integration to send the framebuffer to the terminal via
     /// Sixel, Kitty, or other graphics protocols.
+    ///
+    /// Empty space takes the palette's background color, or stays black when
+    /// none is configured -- black being what an RGB image has to put there,
+    /// having no alpha to say "nothing here" with.
     pub fn to_rgb_image(&self) -> RgbImage {
+        let background = background_color().unwrap_or([0, 0, 0]);
         let mut buf = vec![0u8; self.color.len() * 3];
         buf.par_chunks_mut(3)
             .zip(self.color.par_iter())
-            .for_each(|(out, c)| out.copy_from_slice(c));
+            .zip(self.depth.par_iter())
+            .for_each(|((out, c), d)| {
+                out.copy_from_slice(if *d >= f32::INFINITY { &background } else { c })
+            });
         RgbImage::from_raw(self.width as u32, self.height as u32, buf)
             .expect("buffer is exactly width * height * 3 bytes")
     }
@@ -737,8 +754,9 @@ impl Framebuffer {
     /// allocation, which lets the interactive path write straight into a shared
     /// memory mapping instead of building an intermediate image.
     ///
-    /// Background pixels (depth == INFINITY, colour == black) get alpha = 0 so
-    /// the terminal background shows through.  Drawn pixels get alpha = 255.
+    /// Background pixels (depth == INFINITY) get alpha = 0 so the terminal
+    /// background shows through, or the palette's background color at full
+    /// alpha when one is configured.  Drawn pixels get alpha = 255.
     ///
     /// # Panics
     ///
@@ -751,14 +769,25 @@ impl Framebuffer {
         );
         // Per-pixel and independent; a full frame at Retina resolution is tens
         // of megabytes, enough for the copy to be worth spreading over cores.
+        let background = background_color();
         dst.par_chunks_mut(4)
             .zip(self.color.par_iter())
             .zip(self.depth.par_iter())
             .for_each(|((out, c), d)| {
-                out[0] = c[0];
-                out[1] = c[1];
-                out[2] = c[2];
-                out[3] = if *d >= f32::INFINITY { 0 } else { 255 };
+                let (color, alpha) = if *d < f32::INFINITY {
+                    (*c, 255)
+                } else {
+                    // Nothing here: the configured background at full alpha, or
+                    // transparent so the terminal shows through.
+                    match background {
+                        Some(bg) => (bg, 255),
+                        None => (*c, 0),
+                    }
+                };
+                out[0] = color[0];
+                out[1] = color[1];
+                out[2] = color[2];
+                out[3] = alpha;
             });
     }
 
@@ -1083,14 +1112,22 @@ pub fn framebuffer_to_braille_widget_ssaa(
         let mut run_color: Option<[u8; 3]> = None;
         let mut run_started = false;
 
+        // Every cell carries the background, lit or not: a braille cell's unlit
+        // dots show the terminal through, so painting only the blank cells would
+        // leave the structure's own cells a different color from the space
+        // around them.
+        let background = background_color();
         let flush = |spans: &mut Vec<Span<'static>>, text: &str, color: &Option<[u8; 3]>| {
             if text.is_empty() {
                 return;
             }
-            let style = match color {
+            let mut style = match color {
                 Some(c) => Style::default().fg(Color::Rgb(c[0], c[1], c[2])),
                 None => Style::default(),
             };
+            if let Some(bg) = background {
+                style = style.bg(Color::Rgb(bg[0], bg[1], bg[2]));
+            }
             spans.push(Span::styled(text.to_string(), style));
         };
 

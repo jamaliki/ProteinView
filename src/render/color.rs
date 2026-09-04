@@ -144,7 +144,7 @@ impl ColorScheme {
             // Residue-level stand-in; the Element scheme colors per atom.
             ColorSchemeType::Element => rgb(palette().element.get("C")),
             ColorSchemeType::BFactor => self.bfactor_color(residue),
-            ColorSchemeType::Rainbow => self.rainbow_color(residue),
+            ColorSchemeType::Rainbow => self.rainbow_color(residue, chain),
             ColorSchemeType::Interface => self.interface_color(residue, chain),
             ColorSchemeType::Plddt => self.plddt_residue_color(residue),
         }
@@ -261,11 +261,34 @@ impl ColorScheme {
         bfactor_gradient(avg_b)
     }
 
-    fn rainbow_color(&self, residue: &Residue) -> Color {
+    /// Position along the ramp, N-terminus to C-terminus, *within this chain*.
+    ///
+    /// Measured against the chain rather than the whole structure: a residue
+    /// number means nothing outside its own chain, so dividing by the total
+    /// across every chain left a four-chain protein using the first quarter of
+    /// the ramp and painting all four chains alike -- the one thing an N-to-C
+    /// ramp exists to tell you apart.
+    fn rainbow_position(residue: &Residue, chain: &Chain) -> f64 {
+        let (Some(first), Some(last)) = (chain.residues.first(), chain.residues.last()) else {
+            return 0.0;
+        };
+        let span = f64::from(last.seq_num - first.seq_num);
+        if span <= 0.0 {
+            return 0.0; // single residue, or numbering that does not ascend
+        }
+        (f64::from(residue.seq_num - first.seq_num) / span).clamp(0.0, 1.0)
+    }
+
+    fn rainbow_color(&self, residue: &Residue, chain: &Chain) -> Color {
         if self.total_residues == 0 {
             return Color::White;
         }
-        let t = residue.seq_num as f64 / self.total_residues as f64;
+        let t = Self::rainbow_position(residue, chain);
+        // A configured ramp replaces the sweep; without one, the HSV sweep this
+        // scheme has always used.
+        if let Some(stop) = palette().rainbow_at(t) {
+            return rgb(stop);
+        }
         let hue = (1.0 - t) * 300.0;
         let (r, g, b) = hsv_to_rgb(hue, 1.0, 1.0);
         Color::Rgb(r, g, b)
@@ -373,6 +396,57 @@ mod tests {
             atoms: vec![],
             secondary_structure: ss,
         }
+    }
+
+    /// A chain of `count` residues numbered from `first`.
+    fn numbered_chain(first: i32, count: i32) -> Chain {
+        Chain {
+            id: "A".to_string(),
+            residues: (0..count)
+                .map(|i| Residue {
+                    name: "ALA".to_string(),
+                    seq_num: first + i,
+                    insertion_code: None,
+                    atoms: vec![],
+                    secondary_structure: SecondaryStructure::Coil,
+                })
+                .collect(),
+            molecule_type: MoleculeType::Protein,
+        }
+    }
+
+    #[test]
+    fn the_rainbow_spans_each_chain_from_end_to_end() {
+        // Measured against the residue's own chain, not the whole structure.
+        // Dividing by every residue in a four-chain protein left each chain
+        // using the first quarter of the ramp, and all four looking alike.
+        let chain = numbered_chain(1, 141);
+        let ends = |c: &Chain| {
+            (
+                ColorScheme::rainbow_position(c.residues.first().unwrap(), c),
+                ColorScheme::rainbow_position(c.residues.last().unwrap(), c),
+            )
+        };
+        assert_eq!(ends(&chain), (0.0, 1.0));
+
+        // Numbering that does not start at 1 is just as much a full sweep.
+        let offset = numbered_chain(273, 90);
+        assert_eq!(ends(&offset), (0.0, 1.0));
+
+        let middle = ColorScheme::rainbow_position(&chain.residues[70], &chain);
+        assert!(
+            (middle - 0.5).abs() < 0.01,
+            "the midpoint of a chain should be the midpoint of the ramp, got {middle}"
+        );
+    }
+
+    #[test]
+    fn a_single_residue_chain_does_not_divide_by_zero() {
+        let chain = numbered_chain(7, 1);
+        assert_eq!(
+            ColorScheme::rainbow_position(&chain.residues[0], &chain),
+            0.0
+        );
     }
 
     // ---- is_nucleotide helper ----

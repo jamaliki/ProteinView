@@ -133,6 +133,28 @@ ligand  = "FF00FF"
 ion     = "00FFFF"
 rainbow = "FF00FF"  # ligands under the Rainbow scheme
 
+# --- Rainbow scheme ----------------------------------------------------------
+# The Rainbow scheme runs a ramp along each chain, N-terminus to C-terminus.
+# Leave `colors` out and it uses the built-in HSV sweep (blue -> red). Give it
+# stops and they replace the sweep, spread evenly and blended between, so eight
+# colors make seven gradients rather than eight bands.
+#
+# Each chain gets the whole ramp, so in a multi-chain structure every chain runs
+# the full sweep rather than each taking a slice of it.
+# [rainbow]
+# colors = ["4A00E0", "00B4FF", "00CC66", "FFD700", "FF4500"]
+
+# --- Background --------------------------------------------------------------
+# Paints empty space. Left out, the background stays transparent: the terminal's
+# own background shows through, and a snapshot PNG keeps its alpha channel.
+# Setting it makes snapshots opaque, which is usually what you want for a figure.
+#
+# A background pairs with [fog]: fog fades distant material toward `fog.color`,
+# so a background very far from that color leaves the far side of a structure
+# floating rather than receding. Setting them to the same hue is a good start.
+# [background]
+# color = "1A1B26"
+
 # --- Sequence panel selection ('S') ------------------------------------------
 # Residues picked in the sequence panel.  Carbons of the ball-and-stick overlay
 # take `carbon`; every other element keeps its CPK color, so a picked residue
@@ -203,7 +225,7 @@ auto_rotate    = false        # spin the structure on startup (space)
 # The order below is the cycling order. The colors at the top of this file are
 # always first, under the name "default", so `p` goes:
 #
-#     default -> ocean -> print -> default -> ...
+#     default -> ocean -> print -> aurora -> default -> ...
 #
 # Each [[palette]] takes exactly the same sections as the top of this file, with
 # a `palette.` prefix: [palette.structure], [palette.chain], [palette.element],
@@ -266,3 +288,43 @@ colors = ["1A1A1A", "5C5C5C", "8C8C8C", "BFBFBF"]
 carbon = "D32F2F"  # the one bit of color, so a selection is unmistakable
 marker = "D32F2F"
 cursor = "D32F2F"
+
+# --- aurora: a themed palette, background and rainbow ramp included ----------
+# A palette is not only the structure colors: it carries its own [rainbow] ramp
+# and [background] too, so switching to it with `p` re-themes the whole view.
+# Pair it with --color rainbow (or `c` until Rainbow comes up) to see the ramp.
+[[palette]]
+name = "aurora"
+
+[palette.background]
+color = "#1a1b26"
+
+[palette.rainbow]
+colors = [
+  "#A3E8C7",  # N-terminus: mint
+  "#8EDBD8",
+  "#8FCBF3",
+  "#A5B4F5",
+  "#C5A9F0",
+  "#E5A3E0",
+  "#F5A7C0",
+  "#F7C9A0",  # C-terminus: peach
+]
+
+# Fog is global rather than per-palette, but a dark background wants a fog color
+# near it -- otherwise distant material fades toward a color the background does
+# not share. For this one, put `color = "1A1B26"` in the [fog] section above.
+
+[palette.structure]
+helix = "8FCBF3"
+sheet = "A3E8C7"
+turn  = "C5A9F0"
+coil  = "F5A7C0"
+
+[palette.chain]
+colors = ["A3E8C7", "8FCBF3", "C5A9F0", "F5A7C0", "F7C9A0", "8EDBD8"]
+
+[palette.selection]
+carbon = "F7C9A0"
+marker = "F7C9A0"
+cursor = "E5A3E0"

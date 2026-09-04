@@ -61,32 +61,37 @@ pub fn render_protein<'a>(
     interactions: &'a [Interaction],
     selection: Option<SelectionView<'a>>,
 ) -> Canvas<'a, impl Fn(&mut Context<'_>) + 'a> {
-    Canvas::default()
+    let mut canvas = Canvas::default()
         .marker(Marker::Braille)
         .x_bounds([-width / 2.0, width / 2.0])
-        .y_bounds([-height / 2.0, height / 2.0])
-        .paint(move |ctx| {
-            match viz_mode {
-                VizMode::Backbone | VizMode::Cartoon => {
-                    render_backbone(ctx, protein, camera, color_scheme);
-                }
-                VizMode::Wireframe => {
-                    render_wireframe(ctx, protein, camera, color_scheme);
-                }
+        .y_bounds([-height / 2.0, height / 2.0]);
+    // The canvas has no framebuffer to paint into, so the background is the
+    // widget's own rather than a color written per pixel.
+    if let Some(bg) = palette().background {
+        canvas = canvas.background_color(ratatui::style::Color::Rgb(bg.0[0], bg.0[1], bg.0[2]));
+    }
+    canvas.paint(move |ctx| {
+        match viz_mode {
+            VizMode::Backbone | VizMode::Cartoon => {
+                render_backbone(ctx, protein, camera, color_scheme);
             }
+            VizMode::Wireframe => {
+                render_wireframe(ctx, protein, camera, color_scheme);
+            }
+        }
 
-            if show_ligands {
-                render_ligands(ctx, protein, camera, color_scheme);
-            }
+        if show_ligands {
+            render_ligands(ctx, protein, camera, color_scheme);
+        }
 
-            if let Some(view) = selection.filter(|view| !view.selection.is_empty()) {
-                render_selection(ctx, protein, view, camera);
-            }
+        if let Some(view) = selection.filter(|view| !view.selection.is_empty()) {
+            render_selection(ctx, protein, view, camera);
+        }
 
-            if !interactions.is_empty() {
-                render_interactions(ctx, interactions, camera);
-            }
-        })
+        if !interactions.is_empty() {
+            render_interactions(ctx, interactions, camera);
+        }
+    })
 }
 
 /// Backbone rendering: thick lines between consecutive C-alpha atoms.

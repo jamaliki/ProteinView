@@ -285,6 +285,12 @@ impl PanelSession {
                 } else {
                     color_name(self.settings.base_color)
                 },
+                "palette": crate::config::palette_name(),
+                "palettes": crate::config::config()
+                    .palettes
+                    .iter()
+                    .map(|entry| entry.name.as_str())
+                    .collect::<Vec<_>>(),
                 "current_chain_index": self.settings.current_chain,
                 "current_chain_id": current_chain_id,
                 "interface": self.settings.show_interface,
@@ -387,6 +393,13 @@ enum PanelCommand {
         residues: Vec<WireResidueColor>,
     },
     CycleColor,
+    SetPalette {
+        name: String,
+    },
+    CyclePalette {
+        #[serde(default)]
+        direction: Option<PaletteDirection>,
+    },
     SetViz {
         mode: WireVizMode,
     },
@@ -415,6 +428,15 @@ enum PanelCommand {
     },
     GetState,
     Shutdown,
+}
+
+/// Which way `cycle_palette` steps.  Defaults to `next`, so the common call
+/// needs no parameters at all.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum PaletteDirection {
+    Next,
+    Prev,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -651,6 +673,33 @@ fn apply_command(
             }
             Ok(CommandOutcome::Render)
         }
+        PanelCommand::SetPalette { name } => {
+            if !crate::config::set_palette(name.trim()) {
+                let known: Vec<&str> = crate::config::config()
+                    .palettes
+                    .iter()
+                    .map(|entry| entry.name.as_str())
+                    .collect();
+                return Err(ProtocolError::new(
+                    "invalid_params",
+                    format!(
+                        "no palette named {:?}; this config has {}",
+                        name.trim(),
+                        known.join(", ")
+                    ),
+                ));
+            }
+            // Colors are read as they are drawn; only the ribbon mesh bakes them
+            // in, and `color_dirty` is what rebuilds it.
+            session.color_dirty = true;
+            Ok(CommandOutcome::Render)
+        }
+        PanelCommand::CyclePalette { direction } => {
+            let forward = !matches!(direction, Some(PaletteDirection::Prev));
+            crate::config::cycle_palette(forward);
+            session.color_dirty = true;
+            Ok(CommandOutcome::Render)
+        }
         PanelCommand::SetViz { mode } => {
             session.settings.viz_mode = mode.into();
             Ok(CommandOutcome::Render)
@@ -815,6 +864,8 @@ fn is_supported_command(command: &str) -> bool {
             | "set_color"
             | "set_residue_colors"
             | "cycle_color"
+            | "set_palette"
+            | "cycle_palette"
             | "set_viz"
             | "cycle_viz"
             | "select_chain"

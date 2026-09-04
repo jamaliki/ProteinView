@@ -342,3 +342,59 @@ fn the_example_config_is_exactly_the_built_in_defaults() {
         "docs/config.example.toml should render identically to no config at all"
     );
 }
+
+#[test]
+fn a_configured_background_paints_empty_space_opaque() {
+    // Without one, empty space stays transparent so the terminal shows through
+    // -- which leaves a snapshot PNG with an alpha channel that a figure rarely
+    // wants.  With one, it is painted and opaque.
+    let transparent = render_with("", &[]);
+    let painted = render_with("[background]\ncolor = \"1a1b26\"\n", &[]);
+
+    let corner = transparent.get_pixel(0, 0);
+    assert_eq!(
+        corner[3], 0,
+        "empty space should stay transparent by default"
+    );
+
+    let corner = painted.get_pixel(0, 0);
+    assert_eq!(
+        [corner[0], corner[1], corner[2], corner[3]],
+        [0x1A, 0x1B, 0x26, 255],
+        "a configured background should paint empty space at full alpha"
+    );
+
+    // The structure itself must still be drawn, not flooded over.
+    assert!(
+        painted
+            .pixels()
+            .any(|p| [p[0], p[1], p[2]] != [0x1A, 0x1B, 0x26]),
+        "the structure should still be visible against its background"
+    );
+}
+
+#[test]
+fn a_rainbow_ramp_replaces_the_built_in_sweep() {
+    let stock = render_with("", &["--color", "rainbow"]);
+    let ramped = render_with(
+        r#"
+[rainbow]
+colors = ["A3E8C7", "8EDBD8", "8FCBF3", "A5B4F5", "C5A9F0", "E5A3E0", "F5A7C0", "F7C9A0"]
+"#,
+        &["--color", "rainbow"],
+    );
+    assert!(
+        stock != ramped,
+        "`rainbow.colors` should change what is drawn"
+    );
+
+    // And it only touches Rainbow: the other schemes are unaffected.
+    assert_eq!(
+        render_with(
+            "[rainbow]\ncolors = [\"A3E8C7\", \"F7C9A0\"]\n",
+            &["--color", "chain"]
+        ),
+        render_with("", &["--color", "chain"]),
+        "a rainbow ramp should not change the Chain scheme"
+    );
+}

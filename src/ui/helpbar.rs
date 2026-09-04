@@ -8,6 +8,11 @@ use crate::app::App;
 
 /// Render the keybinding hints bar at the bottom.
 ///
+/// Ordered camera first (rotate, zoom, pan), then what is drawn (color, palette,
+/// mode), then toggles, with `?` and `q` last: the two you look for when you are
+/// done reading the rest.  Grouped keys -- `hjkl`, `wasd` -- rather than one
+/// entry per direction, because the bar has to fit an 80-column terminal.
+///
 /// The hints change with the sequence panel: while it is open the arrow keys
 /// drive the cursor rather than the camera, and saying so here is cheaper than
 /// making the user open the help overlay to find out.
@@ -19,19 +24,12 @@ pub fn render_helpbar(frame: &mut Frame, area: Rect, app: &App) {
     let mut spans = vec![
         Span::styled("╰── ", Style::default().fg(Color::DarkGray)),
         Span::styled(
-            "h/l",
+            "hjkl",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(": rotY  ", Style::default().fg(Color::Gray)),
-        Span::styled(
-            "j/k",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(": rotX  ", Style::default().fg(Color::Gray)),
+        Span::styled(": rotate  ", Style::default().fg(Color::Gray)),
         Span::styled(
             "+/-",
             Style::default()
@@ -94,13 +92,6 @@ pub fn render_helpbar(frame: &mut Frame, area: Rect, app: &App) {
         ),
         Span::styled(": interactions  ", Style::default().fg(Color::Gray)),
         Span::styled(
-            "?",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(": help  ", Style::default().fg(Color::Gray)),
-        Span::styled(
             "g",
             Style::default()
                 .fg(Color::Cyan)
@@ -114,6 +105,13 @@ pub fn render_helpbar(frame: &mut Frame, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(": sequence  ", Style::default().fg(Color::Gray)),
+        Span::styled(
+            "?",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(": help  ", Style::default().fg(Color::Gray)),
         Span::styled(
             "q",
             Style::default()

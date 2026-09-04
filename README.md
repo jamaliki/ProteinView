@@ -231,6 +231,20 @@ An agent can replace all exact residue colors atomically with:
 An empty `residues` array clears the overrides. Invalid or duplicate targets
 leave the prior frame, state, and revision unchanged.
 
+Named palettes are reachable too, so a panel is not stuck on whatever it started
+with:
+
+```json
+{"id":4,"command":"set_palette","name":"aurora"}
+{"id":5,"command":"cycle_palette"}
+{"id":6,"command":"cycle_palette","direction":"prev"}
+```
+
+`get_state` reports the active `palette` and the `palettes` available, so an
+agent can discover them rather than guessing. Naming one that does not exist is
+an `invalid_params` error listing the real names, and leaves the frame
+unchanged.
+
 ## Keybindings
 
 | Key | Action |
@@ -333,6 +347,37 @@ Every fixed color ProteinView draws can be changed. Colors are six hex digits,
 with or without a leading `#`, in either case. Element symbols merge onto the
 built-in CPK table, so overriding carbon leaves the rest alone, while
 `[chain] colors` replaces the chain cycle outright.
+
+### The Rainbow ramp and the background
+
+The Rainbow scheme runs a ramp along each chain, N-terminus to C-terminus.
+`[rainbow] colors` replaces its built-in HSV sweep with stops of your own, spread
+evenly and blended between. `[background] color` paints empty space, which
+otherwise stays transparent so the terminal shows through — set it and snapshot
+PNGs come out opaque, which is usually what a figure wants.
+
+Both belong to a palette, so a named one can carry its own:
+
+```toml
+[[palette]]
+name = "aurora"
+
+[palette.background]
+color = "#1a1b26"
+
+[palette.rainbow]
+colors = ["#A3E8C7", "#8EDBD8", "#8FCBF3", "#A5B4F5",
+          "#C5A9F0", "#E5A3E0", "#F5A7C0", "#F7C9A0"]
+```
+
+```bash
+proteinview examples/4HHB.pdb --palette-name aurora --color rainbow
+```
+
+Every chain gets the whole ramp, so in a multi-chain structure each one sweeps
+end to end rather than taking a slice. A background pairs with `[fog]`: fog fades
+distant material toward `fog.color`, so pick one near your background or the far
+side of a structure floats instead of receding.
 
 ### Depth fog
 

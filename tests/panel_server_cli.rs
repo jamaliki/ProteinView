@@ -144,3 +144,98 @@ fn xyz_distinguishes_default_element_from_explicit_structure_color() {
         );
     }
 }
+
+#[test]
+fn a_panel_can_switch_and_cycle_named_palettes() {
+    // A live panel used to be stuck on whatever palette it started with: there
+    // was no command to change one, and no keyboard to press `p` on.
+    let dir = tempdir().unwrap();
+    let output_path = dir.path().join("panel.png");
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[[palette]]
+name = "ocean"
+[palette.structure]
+helix = "0091EA"
+
+[[palette]]
+name = "print"
+[palette.structure]
+helix = "1A1A1A"
+"#,
+    )
+    .unwrap();
+    let fixture = format!("{}/examples/1UBQ.pdb", env!("CARGO_MANIFEST_DIR"));
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_proteinview"))
+        .args([
+            &fixture,
+            "--panel-server",
+            "--output",
+            output_path.to_str().unwrap(),
+            "--config",
+            config_path.to_str().unwrap(),
+            "--panel-width",
+            "160",
+            "--panel-height",
+            "96",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(
+            br#"{"id":1,"command":"set_palette","name":"print"}
+{"id":2,"command":"cycle_palette","direction":"prev"}
+{"id":3,"command":"set_palette","name":"nope"}
+{"id":4,"command":"get_state"}
+{"id":5,"command":"shutdown"}
+"#,
+        )
+        .unwrap();
+    let result = child.wait_with_output().unwrap();
+    assert!(
+        result.status.success(),
+        "panel server failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let records = String::from_utf8(result.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+
+    // ready, set_palette, cycle_palette, the rejected one, get_state, shutdown.
+    assert_eq!(records[1]["state"]["presentation"]["palette"], "print");
+    assert_eq!(
+        records[2]["state"]["presentation"]["palette"], "ocean",
+        "cycling back from `print` should land on `ocean`"
+    );
+
+    assert_eq!(records[3]["error"]["code"], "invalid_params");
+    let message = records[3]["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("nope") && message.contains("ocean"),
+        "the error should quote the name and list the real ones: {message}"
+    );
+
+    let state = &records[4]["state"]["presentation"];
+    assert_eq!(
+        state["palette"], "ocean",
+        "a rejected palette must leave the active one alone"
+    );
+    assert_eq!(
+        state["palettes"],
+        serde_json::json!(["default", "ocean", "print"]),
+        "state should list what an agent can switch to"
+    );
+}
