@@ -1,5 +1,9 @@
 use std::time::Instant;
 
+/// Viewport extent assumed until a renderer reports the real one: roughly a
+/// braille frame on a normal terminal.
+const DEFAULT_VIEW_EXTENT: f64 = 160.0;
+
 /// 3D camera for viewing protein structures
 #[derive(Debug, Clone)]
 pub struct Camera {
@@ -10,6 +14,13 @@ pub struct Camera {
     pub pan_x: f64,
     pub pan_y: f64,
     pub auto_rotate: bool,
+    /// Shorter side of the render target, in framebuffer pixels.
+    ///
+    /// Panning happens in projected units, which *are* framebuffer pixels, so a
+    /// fixed step crawls on a 1080-pixel FullHD frame while it flies on a
+    /// 144-pixel braille one.  Keeping the viewport extent here lets `pan()`
+    /// move by a fraction of what the viewer can see instead.
+    view_extent: f64,
     last_tick: Instant,
 }
 
@@ -23,6 +34,7 @@ impl Default for Camera {
             pan_x: 0.0,
             pan_y: 0.0,
             auto_rotate: false,
+            view_extent: DEFAULT_VIEW_EXTENT,
             last_tick: Instant::now(),
         }
     }
@@ -100,7 +112,9 @@ impl ProjectionCache {
 impl Camera {
     const ROT_STEP: f64 = 0.1;
     const ZOOM_STEP: f64 = 0.1;
-    const PAN_STEP: f64 = 2.0;
+    /// One pan keypress moves the view by this fraction of its shorter side, so
+    /// a dozen or so presses cross the frame at any resolution.
+    const PAN_FRACTION: f64 = 0.05;
 
     pub fn rotate_x(&mut self, dir: f64) {
         self.rot_x += dir * Self::ROT_STEP;
@@ -118,11 +132,31 @@ impl Camera {
         self.zoom *= 1.0 - Self::ZOOM_STEP;
     }
     pub fn pan(&mut self, dx: f64, dy: f64) {
-        self.pan_x += dx * Self::PAN_STEP;
-        self.pan_y += dy * Self::PAN_STEP;
+        let step = self.pan_step();
+        self.pan_x += dx * step;
+        self.pan_y += dy * step;
     }
+
+    /// Distance one pan keypress covers, in projected (framebuffer-pixel) units.
+    pub fn pan_step(&self) -> f64 {
+        self.view_extent * Self::PAN_FRACTION
+    }
+
+    /// Tell the camera how large the frame it is drawing into is, in pixels.
+    /// Called wherever the zoom is fitted to the viewport.
+    pub fn set_view_extent(&mut self, px_w: f64, px_h: f64) {
+        let extent = px_w.min(px_h);
+        if extent.is_finite() && extent > 0.0 {
+            self.view_extent = extent;
+        }
+    }
+
     pub fn reset(&mut self) {
+        // The viewport is a property of the terminal, not of the view, so a
+        // reset must not throw it away.
+        let view_extent = self.view_extent;
         *self = Self::default();
+        self.view_extent = view_extent;
     }
 
     /// Auto-rotate speed in radians per second (~0.6 rad/s = one full turn in ~10s).
@@ -251,6 +285,47 @@ mod tests {
         assert!((p.x - 3.0).abs() < 1e-12, "expected x=3.0, got {}", p.x);
         // y = 1.0 * 2.0 + 3.0 = 5.0
         assert!((p.y - 5.0).abs() < 1e-12, "expected y=5.0, got {}", p.y);
+    }
+
+    #[test]
+    fn panning_moves_the_same_visible_fraction_at_every_resolution() {
+        // A pan key should cross a braille frame and a FullHD frame in the same
+        // number of presses, which means its step grows with the framebuffer.
+        let mut braille = Camera::default();
+        braille.set_view_extent(288.0, 144.0);
+        let mut fullhd = Camera::default();
+        fullhd.set_view_extent(1920.0, 1080.0);
+
+        braille.pan(1.0, 0.0);
+        fullhd.pan(1.0, 0.0);
+
+        assert!(
+            fullhd.pan_x > 7.0 * braille.pan_x,
+            "FullHD pan should scale with its 1080-pixel viewport: {} vs {}",
+            fullhd.pan_x,
+            braille.pan_x
+        );
+        // Roughly a twentieth of the shorter side, either way.
+        assert!((braille.pan_x - 144.0 * 0.05).abs() < 1e-12);
+        assert!((fullhd.pan_x - 1080.0 * 0.05).abs() < 1e-12);
+    }
+
+    #[test]
+    fn reset_keeps_the_viewport_but_drops_the_view() {
+        let mut cam = Camera::default();
+        cam.set_view_extent(1920.0, 1080.0);
+        cam.pan(1.0, 1.0);
+        cam.rotate_y(1.0);
+        let step = cam.pan_step();
+
+        cam.reset();
+
+        assert_eq!(cam.pan_x, 0.0);
+        assert_eq!(cam.rot_y, 0.0);
+        assert!(
+            (cam.pan_step() - step).abs() < 1e-12,
+            "the terminal has not changed size, so the pan step should not either"
+        );
     }
 
     #[test]

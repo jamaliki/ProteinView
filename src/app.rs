@@ -276,10 +276,10 @@ impl App {
         let vp_cols = term_cols as f64;
         let (font_w, font_h) = picker.font_size();
 
-        let auto_zoom = match render_mode {
+        let (px_w, px_h) = match render_mode {
             RenderMode::FullHD => {
                 let proto = picker.protocol_type();
-                let (px_w, px_h) = if proto != ratatui_image::picker::ProtocolType::Halfblocks
+                if proto != ratatui_image::picker::ProtocolType::Halfblocks
                     && font_w > 0
                     && font_h > 0
                 {
@@ -287,22 +287,17 @@ impl App {
                 } else {
                     // Fallback to braille-like resolution
                     (vp_cols * 2.0, vp_rows * 4.0)
-                };
-                0.9 * px_w.min(px_h) / (2.0 * radius)
+                }
             }
-            RenderMode::HalfBlock | RenderMode::HalfBlockPlus => {
-                let px_w = vp_cols * 2.0;
-                let px_h = vp_rows * 4.0;
-                0.9 * px_w.min(px_h) / (2.0 * radius)
-            }
-            RenderMode::Braille => {
-                let px_w = vp_cols * 2.0;
-                let px_h = vp_rows * 4.0;
-                0.9 * px_w.min(px_h) / (2.0 * radius)
+            RenderMode::HalfBlock | RenderMode::HalfBlockPlus | RenderMode::Braille => {
+                (vp_cols * 2.0, vp_rows * 4.0)
             }
         };
         let mut camera = Camera::default();
-        camera.zoom = auto_zoom;
+        camera.zoom = 0.9 * px_w.min(px_h) / (2.0 * radius);
+        // Pan steps are a fraction of the viewport, so the camera needs to know
+        // how big the frame it draws into is.
+        camera.set_view_extent(px_w, px_h);
 
         let is_large = total_residues > LARGE_STRUCTURE_THRESHOLD;
 
@@ -660,6 +655,9 @@ impl App {
             RenderMode::Braille => (vp_cols * 2.0, vp_rows * 4.0),
         };
         self.camera.zoom = 0.9 * px_w.min(px_h) / (2.0 * radius);
+        // Panning is a fraction of the viewport, so it has to learn the new
+        // framebuffer size alongside the zoom.
+        self.camera.set_view_extent(px_w, px_h);
     }
 
     /// Cycle lower render tiers: Braille -> HD -> HDplus -> Braille.
