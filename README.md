@@ -291,7 +291,7 @@ selection survives closing the panel, and the status bar keeps its count.
 
 Letters are colored by the active color scheme, so the panel and the structure
 read as one picture; the selection and cursor colors come from `[selection]` in
-the palette file.
+the config file.
 
 ## Color Schemes
 
@@ -304,14 +304,15 @@ the palette file.
 | **Rainbow** | N-terminus (blue) to C-terminus (red). |
 | **pLDDT** | AlphaFold confidence (blue=high, orange=low). |
 
-### Customizing the palette
+## Configuration
 
-Every fixed color above can be changed from a TOML file. ProteinView reads
-`~/.config/proteinview/palette.toml` (or `$XDG_CONFIG_HOME/proteinview/palette.toml`)
-when it exists, and `--palette <FILE>` overrides that:
+Colors, depth fog, and the modes ProteinView opens in all come from one TOML
+file. ProteinView reads `~/.config/proteinview/config.toml` (or
+`$XDG_CONFIG_HOME/proteinview/config.toml`) when it exists, and `--config <FILE>`
+overrides that:
 
 ```bash
-proteinview examples/1UBQ.pdb --palette my-palette.toml
+proteinview examples/1UBQ.pdb --config my-config.toml
 ```
 
 Every key is optional — anything you leave out keeps its built-in default, so a
@@ -322,14 +323,57 @@ file this short is valid:
 helix = "#00FFFF"
 ```
 
-Colors are six hex digits, with or without a leading `#`, in either case.
-Element symbols merge onto the built-in CPK table, so overriding carbon leaves
-the rest alone, while `[chain] colors` replaces the chain cycle outright. Unknown
-keys are rejected rather than ignored, so a typo tells you rather than silently
-doing nothing.
+Unknown keys are rejected rather than ignored, so a typo tells you rather than
+silently doing nothing.
 
-See [`docs/palette.example.toml`](docs/palette.example.toml) for a fully
-commented file listing every setting at its default value.
+### Colors
+
+Every fixed color ProteinView draws can be changed. Colors are six hex digits,
+with or without a leading `#`, in either case. Element symbols merge onto the
+built-in CPK table, so overriding carbon leaves the rest alone, while
+`[chain] colors` replaces the chain cycle outright.
+
+### Depth fog
+
+Distant material fades toward a dark blue-gray, which is what gives a dense
+structure its sense of depth. `strength` is the blend at the far side of a
+structure no deeper than `reference_depth`; past that the ramp bends toward the
+front and starts draining chroma, so a ribosome stays readable. If the fog is
+heavier than you like, lower `strength` for small structures and `max_strength`
+for large ones — or turn it off outright:
+
+```toml
+[fog]
+strength = 0.2       # default 0.35
+max_strength = 0.6   # default 0.85; the ceiling for deep structures
+# strength = 0.0     # no fog at all
+```
+
+### Startup defaults
+
+`[defaults]` sets what ProteinView opens with. Each key is the default for the
+flag or key of the same name, and passing the flag still wins:
+
+```toml
+[defaults]
+render = "fullhd"     # braille | halfblock | hdplus | fullhd
+mode = "cartoon"      # cartoon | backbone | wireframe
+color = "chain"       # structure | chain | element | bfactor | rainbow | plddt
+ball_and_stick = true
+ligands = true
+auto_rotate = false
+```
+
+Leaving a key out is not the same as writing its built-in value: an omitted key
+lets the file-type heuristics run — an `.xyz` file opens as an element-colored
+wireframe — while a key you wrote down stands.
+
+See [`docs/config.example.toml`](docs/config.example.toml) for a fully commented
+file listing every setting at its default value.
+
+An older `palette.toml` in the same directory is still read when no
+`config.toml` is there, and `--palette` still works as an alias for `--config`,
+so a file written when this held only colors keeps working.
 
 ## Terminal Support
 

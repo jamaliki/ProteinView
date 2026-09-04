@@ -1,4 +1,5 @@
 use crate::app::VizMode;
+use crate::config::palette;
 use crate::model::interface::{Interaction, InteractionType};
 use crate::model::protein::{Atom, LigandType, MoleculeType, Protein, Residue};
 use crate::model::residue_selection::SelectionView;
@@ -6,7 +7,6 @@ use crate::render::bond::{atoms_bonded, vdw_radius};
 use crate::render::camera::Camera;
 use crate::render::color::{ColorScheme, color_to_rgb};
 use crate::render::framebuffer::{Framebuffer, default_light_dir};
-use crate::render::palette::palette;
 use crate::render::ribbon::RibbonTriangle;
 use rayon::prelude::*;
 
@@ -138,7 +138,7 @@ pub fn render_hd_framebuffer_ssaa(
     // Post-pass: blend all rasterized pixels toward a cool blue-gray fog color
     // based on their z-buffer depth.  This gives uniform depth cues across all
     // rendering modes (triangles, lines, circles).
-    fb.apply_depth_tint([40, 50, 70], 0.35);
+    fb.apply_depth_tint(&crate::config::config().fog);
 
     // Render interaction lines AFTER depth tint so their color coding stays vivid.
     if !interactions.is_empty() {

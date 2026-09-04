@@ -2,6 +2,7 @@ use ratatui::symbols::Marker;
 use ratatui::widgets::canvas::{Canvas, Context, Line};
 
 use crate::app::VizMode;
+use crate::config::palette;
 use crate::model::interface::{Interaction, InteractionType};
 use crate::model::protein::{LigandType, MoleculeType, Protein};
 use crate::model::residue_selection::SelectionView;
@@ -9,7 +10,6 @@ use crate::render::bond::atoms_bonded;
 use crate::render::camera::Camera;
 use crate::render::color::ColorScheme;
 use crate::render::hd::{linking_atoms, selection_atom_color};
-use crate::render::palette::palette;
 
 /// Draw a thick line by rendering parallel offset lines along the perpendicular direction.
 fn draw_thick_line(

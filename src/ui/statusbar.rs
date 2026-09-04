@@ -5,7 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::app::{App, ConnectionType, RenderMode, VizMode};
-use crate::render::palette::palette;
+use crate::config::palette;
 
 /// Render the status bar showing current mode and info
 pub fn render_statusbar(frame: &mut Frame, area: Rect, app: &App) {

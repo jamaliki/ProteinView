@@ -1,9 +1,9 @@
 use std::collections::HashSet;
 
+use crate::config::{Rgb, palette};
 use crate::model::interface::InterfaceAnalysis;
 use crate::model::protein::{Atom, Chain, Ligand, LigandType, Residue, SecondaryStructure};
 use crate::model::selection::ResidueColorOverrides;
-use crate::render::palette::{Rgb, palette};
 use ratatui::style::Color;
 
 /// Convert a palette entry to a ratatui color.
@@ -35,6 +35,23 @@ pub enum ColorSchemeType {
 }
 
 impl ColorSchemeType {
+    /// Parse a scheme name as `--color` and the config file both spell it.
+    ///
+    /// `Interface` is deliberately absent: it is entered by the `f` key or
+    /// `--snapshot-interface-chain`, which need a focus chain to mean anything,
+    /// so there is nothing sensible to start in.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "structure" => Some(Self::Structure),
+            "chain" => Some(Self::Chain),
+            "element" => Some(Self::Element),
+            "bfactor" | "b-factor" => Some(Self::BFactor),
+            "rainbow" => Some(Self::Rainbow),
+            "plddt" => Some(Self::Plddt),
+            _ => None,
+        }
+    }
+
     pub fn next(&self, has_plddt: bool) -> Self {
         match self {
             Self::Structure => Self::Element,

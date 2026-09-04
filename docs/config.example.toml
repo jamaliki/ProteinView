@@ -1,9 +1,9 @@
-# ProteinView color palette
+# ProteinView configuration
 #
-# Copy to ~/.config/proteinview/palette.toml to have it picked up automatically,
+# Copy to ~/.config/proteinview/config.toml to have it picked up automatically,
 # or point at it explicitly:
 #
-#     proteinview structure.pdb --palette docs/palette.example.toml
+#     proteinview structure.pdb --config docs/config.example.toml
 #
 # Every key is optional. Anything you leave out keeps its built-in default, so a
 # file containing nothing but a single color is perfectly valid. Colors are six
@@ -11,6 +11,9 @@
 #
 # Unknown keys are an error rather than being ignored, so a typo tells you
 # instead of silently doing nothing.
+#
+# An older ~/.config/proteinview/palette.toml is still read when no config.toml
+# is there, so a file written when this held only colors keeps working.
 
 # --- Structure scheme (the default, keyed by secondary structure) ------------
 [structure]
@@ -104,3 +107,41 @@ rainbow = "FF00FF"  # ligands under the Rainbow scheme
 carbon = "00E68C"  # ball-and-stick carbons of picked residues
 marker = "00E68C"  # marker sphere shown when ball-and-stick is off ('b')
 cursor = "FFC800"  # the sequence panel's cursor cell
+
+# --- Depth fog ---------------------------------------------------------------
+# How much a pixel fades toward `color` as it recedes. Applies to every
+# framebuffer render (HD, HDplus, FullHD, snapshots and the panel server);
+# braille has no depth buffer to fog.
+#
+# `strength` is the blend at the far side of a structure no deeper than
+# `reference_depth`. Past that depth the ramp bends toward the front and starts
+# draining chroma, both scaled by how much deeper the structure is, so a
+# ribosome stays readable where a flat ramp turns it into confetti. Those extra
+# terms vanish at the reference depth, so a small protein only ever sees
+# `strength`.
+#
+# Fog too heavy? Lower `strength` for small structures, `max_strength` for large
+# ones, and `desaturation` if distant material is losing too much color.
+# `strength = 0.0` turns fog off entirely.
+[fog]
+color           = "283246"  # what distant pixels fade toward
+strength        = 0.35      # blend at the far plane, 0.0..=1.0
+max_strength    = 0.85      # ceiling once depth scaling kicks in
+reference_depth = 55.0      # angstroms; `strength` applies as given at this depth
+curve_gain      = 2.0       # how sharply a deep structure's contrast goes to the front
+desaturation    = 1.0       # chroma drained at the far plane of a deep structure
+
+# --- Startup defaults --------------------------------------------------------
+# What ProteinView opens with. Each key is the default for the flag or key of
+# the same name, and the flag still wins when you pass one.
+#
+# Leaving a key out is not the same as writing its built-in value: an omitted
+# key lets the file-type heuristics run (an .xyz file opens as element-colored
+# wireframe), while writing one down means you meant it, and it stands.
+[defaults]
+render         = "braille"    # braille | halfblock (hd) | hdplus (hd+) | fullhd (pixel)
+mode           = "cartoon"    # cartoon | backbone | wireframe
+color          = "structure"  # structure | chain | element | bfactor | rainbow | plddt
+ball_and_stick = true         # picked residues as ball-and-stick rather than a marker ('b')
+ligands        = true         # draw ligands and ions ('g')
+auto_rotate    = false        # spin the structure on startup (space)

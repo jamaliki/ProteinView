@@ -90,6 +90,19 @@ pub enum VizMode {
 }
 
 impl VizMode {
+    /// Parse a mode name as `--mode` and the config file both spell it.
+    ///
+    /// One parser for both so the file and the flag cannot drift into accepting
+    /// different spellings of the same thing.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "cartoon" => Some(Self::Cartoon),
+            "backbone" => Some(Self::Backbone),
+            "wireframe" => Some(Self::Wireframe),
+            _ => None,
+        }
+    }
+
     pub fn next(&self) -> Self {
         match self {
             Self::Backbone => Self::Cartoon,
@@ -125,6 +138,17 @@ pub enum RenderMode {
 }
 
 impl RenderMode {
+    /// Parse a tier name as `--render` and the config file both spell it.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "braille" => Some(Self::Braille),
+            "halfblock" | "hd" | "half-block" => Some(Self::HalfBlock),
+            "hdplus" | "hd+" | "halfblockplus" | "half-block-plus" => Some(Self::HalfBlockPlus),
+            "fullhd" | "pixel" | "full-hd" => Some(Self::FullHD),
+            _ => None,
+        }
+    }
+
     pub fn name(&self) -> &str {
         match self {
             Self::Braille => "Braille",
@@ -293,8 +317,11 @@ impl App {
                 (vp_cols * 2.0, vp_rows * 4.0)
             }
         };
+        let defaults = crate::config::config().defaults;
+
         let mut camera = Camera::default();
         camera.zoom = 0.9 * px_w.min(px_h) / (2.0 * radius);
+        camera.auto_rotate = defaults.auto_rotate.unwrap_or(false);
         // Pan steps are a fraction of the viewport, so the camera needs to know
         // how big the frame it draws into is.
         camera.set_view_extent(px_w, px_h);
@@ -376,7 +403,7 @@ impl App {
             current_chain: 0,
             render_mode,
             show_help: false,
-            show_ligands: true,
+            show_ligands: defaults.ligands.unwrap_or(true),
             show_interface: false,
             show_interactions: false,
             interface_analysis,
@@ -398,7 +425,7 @@ impl App {
             shm_slot: std::cell::Cell::new(0),
             show_sequence: false,
             selection,
-            show_ball_stick: true,
+            show_ball_stick: defaults.ball_and_stick.unwrap_or(true),
             seq_cursor: (cursor_chain, 0),
             seq_anchor: None,
             seq_scroll: 0,

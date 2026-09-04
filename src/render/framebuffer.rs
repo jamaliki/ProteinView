@@ -5,38 +5,13 @@ use ratatui::widgets::Paragraph;
 use rayon::prelude::*;
 use std::sync::OnceLock;
 
-/// Depth span, in angstroms, at which the caller's fog strength applies as
-/// given.  Roughly the depth of a small single-domain protein, so structures of
-/// that size and below keep exactly the appearance they always had.
-const FOG_REFERENCE_DEPTH: f64 = 55.0;
+use crate::config::Fog;
 
-/// Ceiling on the depth-scaled fog strength.
+/// The fog's own parameters -- reference depth, ceiling, curvature and chroma
+/// drain -- live on [`Fog`], where the config file can reach them.  The defaults
+/// there are the values this renderer was tuned at, and the doc comments on each
+/// field say what moving one does.
 ///
-/// At this blend a distant feature keeps a sixth of its own color: it has to
-/// drop far enough to stop competing with the front of a ribosome, but the fog
-/// color is well above the terminal background, so it never disappears.
-const FOG_MAX_STRENGTH: f64 = 0.85;
-
-/// Curvature of the fog ramp, in multiples of `ln(depth span / reference depth)`.
-///
-/// This is the knob that decides how much of a very deep structure's contrast
-/// budget goes to the front.  At 2.0 the ramp's e-folding distance lands
-/// between 75 and 120 A for every span from 1.5x to 10x the reference depth,
-/// so the fog behaves like real distance fog with a fixed absolute scale
-/// length while still collapsing to the old linear ramp at the reference
-/// depth.  Higher gains read as a spotlit front shell with the rest of the
-/// structure in shadow, which loses the overall silhouette.
-const FOG_CURVE_GAIN: f64 = 2.0;
-
-/// Chroma removed at the far plane once the structure is much deeper than the
-/// reference depth.
-///
-/// Luminance alone is a weak cue in a densely overlapped backbone render: the
-/// chain palette is saturated enough that a half-strength blend toward a dark
-/// tint still reads as vivid green or magenta.  Draining the chroma as well
-/// separates near from far even where the two are interleaved pixel by pixel.
-const FOG_MAX_DESATURATION: f64 = 1.0;
-
 /// Entries in the per-frame fog ramp table.
 ///
 /// The ramp needs an `exp` per pixel, which at 4 MP costs more than the rest
@@ -252,7 +227,7 @@ impl Framebuffer {
     /// - Nearest pixels (z == z_min) keep their original color
     /// - Farthest pixels (z == z_max) are blended most toward `fog_color`
     /// - The `fog_strength` parameter (0.0..=1.0) sets the blend at the far
-    ///   plane for a structure no deeper than [`FOG_REFERENCE_DEPTH`]
+    ///   plane for a structure no deeper than [`Fog::reference_depth`]
     ///
     /// # Why the ramp bends for deep structures
     ///
@@ -274,14 +249,18 @@ impl Framebuffer {
     ///
     /// Luminance is also not enough on its own.  Against a saturated chain
     /// palette a 0.4 blend toward a dark blue-gray still reads as vivid green,
-    /// so the ramp drains chroma as well ([`FOG_MAX_DESATURATION`]); that is
+    /// so the ramp drains chroma as well ([`Fog::desaturation`]); that is
     /// the cue that survives when near and far material interleaves pixel by
     /// pixel.
     ///
     /// All three terms -- strength, curvature and desaturation -- are keyed to
     /// the span/reference ratio and vanish together at it, so structures at or
     /// below the reference depth keep exactly the appearance they always had.
-    pub fn apply_depth_tint(&mut self, fog_color: [u8; 3], fog_strength: f64) {
+    pub fn apply_depth_tint(&mut self, fog: &Fog) {
+        if fog.strength <= 0.0 {
+            return; // fog turned off in the config -- nothing to do
+        }
+        let fog_color = fog.color.0;
         // Find z_min and z_max across all valid (non-background) pixels.
         let (z_min, z_max) = self
             .depth
@@ -305,11 +284,11 @@ impl Framebuffer {
         // Depth is in world units (angstroms): the projection applies zoom only
         // to x and y, so this scaling is independent of how far the user has
         // zoomed in.
-        let strength = (fog_strength * f64::from(z_range) / FOG_REFERENCE_DEPTH)
-            .clamp(fog_strength, FOG_MAX_STRENGTH);
+        let strength = (fog.strength * f64::from(z_range) / fog.reference_depth)
+            .clamp(fog.strength, fog.max_strength);
 
         let inv_range = 1.0 / z_range;
-        let span_ratio = f64::from(z_range) / FOG_REFERENCE_DEPTH;
+        let span_ratio = f64::from(z_range) / fog.reference_depth;
 
         // Small structures take the straight ramp, untouched and untabulated,
         // so their frames stay bit-for-bit what they were.
@@ -327,11 +306,11 @@ impl Framebuffer {
             return;
         }
 
-        let curvature = FOG_CURVE_GAIN * span_ratio.ln();
+        let curvature = fog.curve_gain * span_ratio.ln();
         let curve_norm = 1.0 / (1.0 - (-curvature).exp());
         // Ties the chroma drain to the same ratio as the other two terms, so a
         // structure that only just clears the reference depth barely changes.
-        let desaturation = FOG_MAX_DESATURATION * (1.0 - 1.0 / span_ratio);
+        let desaturation = fog.desaturation * (1.0 - 1.0 / span_ratio);
 
         let mut blend_ramp = [0.0f32; FOG_RAMP_STEPS];
         let mut desat_ramp = [0.0f32; FOG_RAMP_STEPS];
@@ -1444,6 +1423,14 @@ mod tests {
         assert_eq!(fb.color[9 * 10 + 9], [255, 255, 255]);
     }
 
+    /// The default fog, at a chosen far-plane strength.
+    fn fog_at(strength: f64) -> Fog {
+        Fog {
+            strength,
+            ..Fog::default()
+        }
+    }
+
     /// Build a framebuffer whose drawn pixels span `depth` angstroms.
     fn fb_with_depth_span(depth: f32) -> Framebuffer {
         let mut fb = Framebuffer::new(16, 1);
@@ -1458,9 +1445,9 @@ mod tests {
     /// always had: no curvature, no chroma drain.
     #[test]
     fn shallow_structures_keep_the_linear_ramp() {
-        let span = FOG_REFERENCE_DEPTH as f32 * 0.9;
+        let span = Fog::default().reference_depth as f32 * 0.9;
         let mut fb = fb_with_depth_span(span);
-        fb.apply_depth_tint([40, 50, 70], 0.35);
+        fb.apply_depth_tint(&fog_at(0.35));
 
         let fog = [40.0, 50.0, 70.0];
         let base = [200.0, 40.0, 160.0];
@@ -1477,12 +1464,43 @@ mod tests {
         }
     }
 
+    /// The config's strength knob has to reach the pixels, and zero has to mean
+    /// off rather than "a little".
+    #[test]
+    fn fog_strength_is_what_the_config_says_it_is() {
+        let far = |strength: f64| {
+            let mut fb = fb_with_depth_span(Fog::default().reference_depth as f32 * 0.9);
+            fb.apply_depth_tint(&fog_at(strength));
+            *fb.color.last().unwrap()
+        };
+
+        let unfogged = [200, 40, 160];
+        assert_eq!(
+            far(0.0),
+            unfogged,
+            "strength 0.0 must leave the frame alone"
+        );
+
+        // Toward the fog colour, monotonically, and the light setting has to be
+        // visibly lighter than the default -- that is the whole point of the knob.
+        let (light, default, heavy) = (far(0.15), far(0.35), far(0.6));
+        assert!(
+            light[0] > default[0] && default[0] > heavy[0],
+            "more strength should mean more fog: {light:?} {default:?} {heavy:?}"
+        );
+        assert!(
+            i32::from(unfogged[0]) - i32::from(light[0])
+                < i32::from(unfogged[0]) - i32::from(default[0]),
+            "0.15 should fog less than 0.35: {light:?} vs {default:?}"
+        );
+    }
+
     /// The nearest pixel is never fogged, however deep the structure.
     #[test]
     fn the_nearest_pixel_keeps_its_colour() {
         for span in [30.0, 227.0] {
             let mut fb = fb_with_depth_span(span);
-            fb.apply_depth_tint([40, 50, 70], 0.35);
+            fb.apply_depth_tint(&fog_at(0.35));
             assert_eq!(fb.color[0], [200, 40, 160], "span {span}");
         }
     }
@@ -1497,10 +1515,10 @@ mod tests {
             hi - lo
         };
 
-        let mut shallow = fb_with_depth_span(FOG_REFERENCE_DEPTH as f32 * 0.9);
-        shallow.apply_depth_tint([40, 50, 70], 0.35);
+        let mut shallow = fb_with_depth_span(Fog::default().reference_depth as f32 * 0.9);
+        shallow.apply_depth_tint(&fog_at(0.35));
         let mut deep = fb_with_depth_span(227.0);
-        deep.apply_depth_tint([40, 50, 70], 0.35);
+        deep.apply_depth_tint(&fog_at(0.35));
 
         let far_shallow = *shallow.color.last().unwrap();
         let far_deep = *deep.color.last().unwrap();
@@ -1801,8 +1819,7 @@ mod tests {
         fb.depth[1] = 10.0;
         // Pixels 2 and 3 remain at INFINITY (background)
 
-        let fog = [40, 50, 70];
-        fb.apply_depth_tint(fog, 0.5);
+        fb.apply_depth_tint(&fog_at(0.5));
 
         // Near pixel (z=1, t=0.0) should stay unchanged
         assert_eq!(
@@ -1832,7 +1849,7 @@ mod tests {
         fb.depth[1] = 10.0;
         // Pixels 2 and 3 are background (depth = INFINITY, color = [0,0,0])
 
-        fb.apply_depth_tint([40, 50, 70], 0.5);
+        fb.apply_depth_tint(&fog_at(0.5));
 
         // Background pixels must remain [0,0,0]
         assert_eq!(

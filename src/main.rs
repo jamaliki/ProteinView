@@ -1,4 +1,5 @@
 mod app;
+mod config;
 mod event;
 mod model;
 mod panel_server;
@@ -49,24 +50,28 @@ struct Cli {
     fullhd: bool,
 
     /// Render mode: braille, halfblock (or hd), hdplus (or hd+), fullhd (or pixel)
+    /// [default: braille, or `defaults.render` from the config file]
     #[arg(long = "render", value_name = "MODE")]
     render_mode: Option<String>,
 
     /// Color scheme: structure, element, chain, plddt, bfactor, rainbow
-    #[arg(long, default_value = "structure")]
-    color: String,
+    /// [default: structure, or `defaults.color` from the config file]
+    #[arg(long)]
+    color: Option<String>,
 
     /// Override one exact polymer residue color: CHAIN:RES[ICODE]=RRGGBB
     #[arg(long, value_name = "SELECTOR=RRGGBB")]
     residue_color: Vec<ResidueColorSpec>,
 
-    /// Palette file (TOML). Defaults to ~/.config/proteinview/palette.toml when present
-    #[arg(long, value_name = "FILE")]
-    palette: Option<PathBuf>,
+    /// Config file (TOML): colors, fog, startup defaults.
+    /// Defaults to ~/.config/proteinview/config.toml when present
+    #[arg(long, alias = "palette", value_name = "FILE")]
+    config: Option<PathBuf>,
 
     /// Visualization mode: cartoon, backbone, wireframe
-    #[arg(long, default_value = "cartoon")]
-    mode: String,
+    /// [default: cartoon, or `defaults.mode` from the config file]
+    #[arg(long)]
+    mode: Option<String>,
 
     /// Fetch structure from RCSB PDB by ID
     #[arg(long)]
@@ -179,10 +184,11 @@ fn handle_sequence_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Resolve the color palette before anything renders.  A bad palette is a
-    // hard error rather than a silent fallback: ignoring a file the user wrote
-    // is worse than refusing to start.
-    render::palette::init(cli.palette.as_deref())?;
+    // Resolve the config before anything renders or reads a default from it.  A
+    // bad config is a hard error rather than a silent fallback: ignoring a file
+    // the user wrote is worse than refusing to start.
+    config::init(cli.config.as_deref())?;
+    let defaults = config::config().defaults;
 
     // Rasterization splits the framebuffer into bands, so it scales with cores
     // until it becomes memory-bound.  Default to one thread per core: with the
@@ -264,18 +270,13 @@ fn main() -> Result<()> {
     let connection_type = ConnectionType::detect();
     log!(logfile, "connection type: {:?}", connection_type);
 
-    // Determine render mode from CLI flags
+    // Determine render mode: an explicit flag first, then the config file, then
+    // the built-in default.
     let render_mode = if let Some(mode_str) = &cli.render_mode {
-        match mode_str.to_ascii_lowercase().as_str() {
-            "braille" => RenderMode::Braille,
-            "halfblock" | "hd" | "half-block" => RenderMode::HalfBlock,
-            "hdplus" | "hd+" | "halfblockplus" | "half-block-plus" => RenderMode::HalfBlockPlus,
-            "fullhd" | "pixel" | "full-hd" => RenderMode::FullHD,
-            _ => {
-                eprintln!("Warning: unknown render mode '{}', using default", mode_str);
-                RenderMode::Braille
-            }
-        }
+        RenderMode::parse(mode_str).unwrap_or_else(|| {
+            eprintln!("Warning: unknown render mode '{}', using default", mode_str);
+            RenderMode::Braille
+        })
     } else if cli.fullhd {
         // --fullhd / --pixel always forces FullHD regardless of SSH
         RenderMode::FullHD
@@ -286,51 +287,40 @@ fn main() -> Result<()> {
             ConnectionType::Ssh => RenderMode::HalfBlock,
         }
     } else {
-        RenderMode::Braille
+        defaults.render.unwrap_or(RenderMode::Braille)
     };
 
-    let user_explicit_color =
-        std::env::args().any(|argument| argument == "--color" || argument.starts_with("--color="));
-
-    // Parse CLI color scheme override.
-    let color_override = match cli.color.to_ascii_lowercase().as_str() {
-        "structure" => None, // default, no override needed
-        "element" => Some(render::color::ColorSchemeType::Element),
-        "chain" => Some(render::color::ColorSchemeType::Chain),
-        "bfactor" | "b-factor" => Some(render::color::ColorSchemeType::BFactor),
-        "rainbow" => Some(render::color::ColorSchemeType::Rainbow),
-        "plddt" => Some(render::color::ColorSchemeType::Plddt),
-        _ => {
-            eprintln!(
-                "Warning: unknown color scheme '{}', using structure",
-                cli.color
-            );
-            None
-        }
+    // Color scheme and visualization mode both resolve the same way: the flag if
+    // it was given, else the config file, else the built-in default.  Whether
+    // either was *chosen* -- by flag or by file -- is what the XYZ heuristic
+    // below keys off, so a written-down preference is not silently overruled by
+    // the file extension.
+    let color_override = match &cli.color {
+        Some(name) => Some(
+            render::color::ColorSchemeType::parse(name).unwrap_or_else(|| {
+                eprintln!("Warning: unknown color scheme '{name}', using structure");
+                render::color::ColorSchemeType::Structure
+            }),
+        ),
+        None => defaults.color,
     };
+    let user_explicit_color = cli.color.is_some() || defaults.color.is_some();
 
-    // Parse CLI visualization mode override.
-    let user_explicit_mode = !cli.mode.eq_ignore_ascii_case("cartoon")
-        || std::env::args().any(|a| a == "--mode" || a.starts_with("--mode="));
-    let viz_mode = match cli.mode.to_ascii_lowercase().as_str() {
-        "cartoon" => VizMode::Cartoon,
-        "backbone" => VizMode::Backbone,
-        "wireframe" => VizMode::Wireframe,
-        _ => {
-            eprintln!(
-                "Warning: unknown visualization mode '{}', using cartoon",
-                cli.mode
-            );
+    let user_explicit_mode = cli.mode.is_some() || defaults.mode.is_some();
+    let viz_mode = match &cli.mode {
+        Some(name) => VizMode::parse(name).unwrap_or_else(|| {
+            eprintln!("Warning: unknown visualization mode '{name}', using cartoon");
             VizMode::Cartoon
-        }
+        }),
+        None => defaults.mode.unwrap_or(VizMode::Cartoon),
     };
 
     // XYZ files default to Element coloring + Wireframe mode unless overridden.
     let (color_override, viz_mode) = if is_xyz {
-        let color = if color_override.is_none() && !user_explicit_color {
-            Some(render::color::ColorSchemeType::Element)
-        } else {
+        let color = if user_explicit_color {
             color_override
+        } else {
+            Some(render::color::ColorSchemeType::Element)
         };
         let viz = if !user_explicit_mode {
             VizMode::Wireframe

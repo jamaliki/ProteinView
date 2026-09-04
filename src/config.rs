@@ -1,23 +1,28 @@
-//! User-configurable color palette.
+//! User-configurable settings.
 //!
-//! Every fixed color ProteinView draws comes from a [`Palette`].  The built-in
-//! defaults reproduce the previously hardcoded colors exactly, so a user with no
-//! config file sees no change.  A TOML file may override any subset of them:
-//! anything omitted keeps its default.
+//! One TOML file holds everything the user can tune without recompiling: every
+//! fixed color ProteinView draws ([`Palette`]), the depth fog ([`Fog`]), and the
+//! modes it opens in ([`Defaults`]).  The built-in values reproduce the
+//! previously hardcoded ones exactly, so a user with no config file sees no
+//! change, and a file may override any subset: anything omitted keeps its
+//! default.
 //!
-//! The palette is resolved once at startup and read-only thereafter, so it lives
+//! The config is resolved once at startup and read-only thereafter, so it lives
 //! in a process-wide [`OnceLock`] rather than being threaded through every
-//! renderer.  Call [`init`] once from `main`; everything else reads [`palette`].
+//! renderer.  Call [`init`] once from `main`; everything else reads [`config`]
+//! or, for the common case, [`palette`].
 //!
-//! Procedural schemes (Rainbow's HSV sweep) and the depth fog are not covered
-//! here yet.
+//! Procedural schemes (Rainbow's HSV sweep) are not covered here yet.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
+
+use crate::app::{RenderMode, VizMode};
+use crate::render::color::ColorSchemeType;
 
 /// An RGB triple, deserialized from a hex string such as `"FF0080"` or `"#ff0080"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -258,6 +263,172 @@ impl Default for SelectionPalette {
 }
 
 // ---------------------------------------------------------------------------
+// Depth fog
+// ---------------------------------------------------------------------------
+
+/// Depth fog: how much a pixel fades toward the background as it recedes.
+///
+/// The renderer applies `strength` at the far plane of a structure no deeper
+/// than `reference_depth`.  Beyond that the ramp bends and the chroma drain
+/// comes in, both keyed to how much deeper the structure is, so that a ribosome
+/// stays readable where a flat ramp turns it into confetti.  All four of those
+/// terms vanish together at the reference depth, which is what lets a small
+/// protein look exactly as it did before any of this existed.
+///
+/// Turning fog off entirely is `strength = 0.0`.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Fog {
+    /// What distant pixels fade toward.  Well above the terminal background, so
+    /// the far side of a structure dims rather than disappearing.
+    pub color: Rgb,
+    /// Blend at the far plane of a structure at or below `reference_depth`.
+    pub strength: f64,
+    /// Ceiling on the depth-scaled blend, however deep the structure is.
+    pub max_strength: f64,
+    /// Depth span, in angstroms, at which `strength` applies as given.  Roughly
+    /// the depth of a small single-domain protein.
+    pub reference_depth: f64,
+    /// How sharply the ramp concentrates its contrast at the front of a deep
+    /// structure, in multiples of `ln(span / reference_depth)`.  Higher reads as
+    /// a spotlit front shell with the rest in shadow.
+    pub curve_gain: f64,
+    /// Chroma drained at the far plane once a structure is much deeper than the
+    /// reference depth.  `0.0` fades by brightness alone.
+    pub desaturation: f64,
+}
+
+impl Default for Fog {
+    fn default() -> Self {
+        Self {
+            color: Rgb::new(40, 50, 70),
+            strength: 0.35,
+            max_strength: 0.85,
+            reference_depth: 55.0,
+            curve_gain: 2.0,
+            desaturation: 1.0,
+        }
+    }
+}
+
+impl Fog {
+    fn validate(&self) -> Result<()> {
+        let unit = |name: &str, value: f64| -> Result<()> {
+            if !(0.0..=1.0).contains(&value) {
+                anyhow::bail!("`fog.{name}` must be between 0.0 and 1.0, got {value}");
+            }
+            Ok(())
+        };
+        unit("strength", self.strength)?;
+        unit("max_strength", self.max_strength)?;
+        unit("desaturation", self.desaturation)?;
+        if self.max_strength < self.strength {
+            anyhow::bail!(
+                "`fog.max_strength` ({}) must be at least `fog.strength` ({}): the ceiling cannot sit below the value it caps",
+                self.max_strength,
+                self.strength
+            );
+        }
+        // Finiteness is checked explicitly: NaN compares false against
+        // everything, so a bare `> 0.0` would wave it through.
+        if !self.reference_depth.is_finite() || self.reference_depth <= 0.0 {
+            anyhow::bail!(
+                "`fog.reference_depth` must be a finite depth greater than 0, got {}",
+                self.reference_depth
+            );
+        }
+        if !self.curve_gain.is_finite() || self.curve_gain < 0.0 {
+            anyhow::bail!(
+                "`fog.curve_gain` must be finite and not negative, got {}",
+                self.curve_gain
+            );
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Startup defaults
+// ---------------------------------------------------------------------------
+
+/// What ProteinView opens with, for the settings that also have a command-line
+/// flag or a key binding.
+///
+/// Every field is optional, and `None` means "not configured": the built-in
+/// behaviour, including the heuristics that pick a mode from the file itself,
+/// still applies.  A command-line flag always wins over the file, and the file
+/// always wins over a heuristic -- someone who wrote a preference down meant it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Defaults {
+    /// Render tier: `braille`, `halfblock`, `hdplus` or `fullhd`.  Same
+    /// spellings as `--render`.
+    #[serde(deserialize_with = "de_render_mode")]
+    pub render: Option<RenderMode>,
+    /// Visualization: `cartoon`, `backbone` or `wireframe`.  Same spellings as
+    /// `--mode`.
+    #[serde(deserialize_with = "de_viz_mode")]
+    pub mode: Option<VizMode>,
+    /// Color scheme: `structure`, `chain`, `element`, `bfactor`, `rainbow` or
+    /// `plddt`.  Same spellings as `--color`.
+    #[serde(deserialize_with = "de_color_scheme")]
+    pub color: Option<ColorSchemeType>,
+    /// Draw picked residues as ball-and-stick rather than a single marker.
+    pub ball_and_stick: Option<bool>,
+    /// Draw ligands and ions.
+    pub ligands: Option<bool>,
+    /// Spin the structure when nothing else is driving the camera.
+    pub auto_rotate: Option<bool>,
+}
+
+/// Deserialize one of the mode names, reusing the parser the CLI uses so the
+/// file and the flag can never accept different spellings.
+fn de_named<'de, D, T>(
+    deserializer: D,
+    parse: fn(&str) -> Option<T>,
+    what: &str,
+    accepted: &str,
+) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::Error;
+    let raw = String::deserialize(deserializer)?;
+    parse(&raw).map(Some).ok_or_else(|| {
+        D::Error::custom(format!(
+            "unknown {what} {raw:?}; expected one of {accepted}"
+        ))
+    })
+}
+
+fn de_render_mode<'de, D: Deserializer<'de>>(d: D) -> Result<Option<RenderMode>, D::Error> {
+    de_named(
+        d,
+        RenderMode::parse,
+        "render mode",
+        "braille, halfblock, hdplus, fullhd",
+    )
+}
+
+fn de_viz_mode<'de, D: Deserializer<'de>>(d: D) -> Result<Option<VizMode>, D::Error> {
+    de_named(
+        d,
+        VizMode::parse,
+        "visualization mode",
+        "cartoon, backbone, wireframe",
+    )
+}
+
+fn de_color_scheme<'de, D: Deserializer<'de>>(d: D) -> Result<Option<ColorSchemeType>, D::Error> {
+    de_named(
+        d,
+        ColorSchemeType::parse,
+        "color scheme",
+        "structure, chain, element, bfactor, rainbow, plddt",
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Palette
 // ---------------------------------------------------------------------------
 
@@ -310,6 +481,19 @@ impl Palette {
 }
 
 // ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
+
+/// Everything resolved from the config file: built-in values with any
+/// configured overrides applied.
+#[derive(Debug, Clone, Default)]
+pub struct Config {
+    pub palette: Palette,
+    pub fog: Fog,
+    pub defaults: Defaults,
+}
+
+// ---------------------------------------------------------------------------
 // Config file
 // ---------------------------------------------------------------------------
 
@@ -334,9 +518,12 @@ struct ChainFile {
     colors: Option<Vec<Rgb>>,
 }
 
+/// The file as written.  Color sections sit at the top level, where they have
+/// always been, so a palette file from before the config grew past colors still
+/// parses unchanged; `fog` and `defaults` are new sections beside them.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-struct PaletteFile {
+struct ConfigFile {
     structure: StructurePalette,
     nucleotide: NucleotidePalette,
     chain: ChainFile,
@@ -346,10 +533,12 @@ struct PaletteFile {
     interface: InterfacePalette,
     ligand: LigandPalette,
     selection: SelectionPalette,
+    fog: Fog,
+    defaults: Defaults,
 }
 
-impl PaletteFile {
-    fn resolve(self) -> Result<Palette> {
+impl ConfigFile {
+    fn resolve(self) -> Result<Config> {
         let mut palette = Palette {
             structure: self.structure,
             nucleotide: self.nucleotide,
@@ -378,56 +567,76 @@ impl PaletteFile {
                 .insert(symbol.trim().to_ascii_uppercase(), color);
         }
 
-        Ok(palette)
+        self.fog.validate()?;
+
+        Ok(Config {
+            palette,
+            fog: self.fog,
+            defaults: self.defaults,
+        })
     }
 }
 
-/// Parse a palette from TOML text, filling anything omitted from the defaults.
-pub fn parse(text: &str) -> Result<Palette> {
-    toml::from_str::<PaletteFile>(text)?.resolve()
+/// Parse a config from TOML text, filling anything omitted from the defaults.
+pub fn parse(text: &str) -> Result<Config> {
+    toml::from_str::<ConfigFile>(text)?.resolve()
 }
 
-/// Read and parse a palette file.
-pub fn load(path: &Path) -> Result<Palette> {
+/// Read and parse a config file.
+pub fn load(path: &Path) -> Result<Config> {
     let text = std::fs::read_to_string(path)
-        .with_context(|| format!("cannot read palette file {}", path.display()))?;
-    parse(&text).with_context(|| format!("invalid palette file {}", path.display()))
+        .with_context(|| format!("cannot read config file {}", path.display()))?;
+    parse(&text).with_context(|| format!("invalid config file {}", path.display()))
 }
 
-/// The default palette file location: `$XDG_CONFIG_HOME/proteinview/palette.toml`,
-/// falling back to `~/.config/proteinview/palette.toml`.
-pub fn default_config_path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
+/// Config file locations, in the order they are tried:
+/// `$XDG_CONFIG_HOME/proteinview/config.toml` (falling back to `~/.config`),
+/// then `palette.toml` beside it.
+///
+/// The second name is what this file was called when it held nothing but
+/// colors.  It still works, so an upgrade does not quietly stop reading a file
+/// someone already wrote.
+pub fn default_config_paths() -> Vec<PathBuf> {
+    let Some(base) = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
-    Some(base.join("proteinview").join("palette.toml"))
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+    else {
+        return Vec::new();
+    };
+    let dir = base.join("proteinview");
+    vec![dir.join("config.toml"), dir.join("palette.toml")]
 }
 
-static PALETTE: OnceLock<Palette> = OnceLock::new();
+static CONFIG: OnceLock<Config> = OnceLock::new();
 
-/// The active palette.  Defaults are used if [`init`] was never called.
+/// The active config.  Defaults are used if [`init`] was never called.
+pub fn config() -> &'static Config {
+    CONFIG.get_or_init(Config::default)
+}
+
+/// The active palette, the part of the config nearly every caller wants.
 pub fn palette() -> &'static Palette {
-    PALETTE.get_or_init(Palette::default)
+    &config().palette
 }
 
-/// Resolve the palette once, from `explicit` if given, else from the default
-/// config path if it exists, else from the built-in defaults.
+/// Resolve the config once, from `explicit` if given, else from the first
+/// default path that exists, else from the built-in defaults.
 ///
 /// An explicit path that cannot be read is an error; so is a malformed file in
-/// either location, since silently ignoring a palette the user wrote is worse
+/// either location, since silently ignoring a config the user wrote is worse
 /// than refusing to start.  Returns the path that was loaded, if any.
 pub fn init(explicit: Option<&Path>) -> Result<Option<PathBuf>> {
     let chosen = match explicit {
         Some(path) => Some(path.to_path_buf()),
-        None => default_config_path().filter(|p| p.is_file()),
+        None => default_config_paths().into_iter().find(|p| p.is_file()),
     };
 
     let (resolved, loaded) = match &chosen {
         Some(path) => (load(path)?, Some(path.clone())),
-        None => (Palette::default(), None),
+        None => (Config::default(), None),
     };
 
-    let _ = PALETTE.set(resolved);
+    let _ = CONFIG.set(resolved);
     Ok(loaded)
 }
 
@@ -435,9 +644,14 @@ pub fn init(explicit: Option<&Path>) -> Result<Option<PathBuf>> {
 mod tests {
     use super::*;
 
+    /// Most of these tests are about colors; unwrap the palette for them.
+    fn parse_palette(text: &str) -> Result<Palette> {
+        Ok(parse(text)?.palette)
+    }
+
     #[test]
     fn empty_config_is_the_default_palette() {
-        let p = parse("").unwrap();
+        let p = parse_palette("").unwrap();
         let d = Palette::default();
         assert_eq!(p.structure.helix, d.structure.helix);
         assert_eq!(p.chains, d.chains);
@@ -447,7 +661,7 @@ mod tests {
 
     #[test]
     fn overrides_apply_and_the_rest_stays_default() {
-        let p = parse(
+        let p = parse_palette(
             r##"
             [structure]
             helix = "#112233"
@@ -463,7 +677,7 @@ mod tests {
     #[test]
     fn element_symbols_merge_rather_than_replace() {
         // Overriding carbon must not drop the rest of the CPK table.
-        let p = parse(
+        let p = parse_palette(
             r#"
             [element.symbols]
             C = "010203"
@@ -477,7 +691,7 @@ mod tests {
 
     #[test]
     fn element_lookup_is_case_insensitive_both_ways() {
-        let p = parse(
+        let p = parse_palette(
             r#"
             [element.symbols]
             se = "0A0B0C"
@@ -491,7 +705,7 @@ mod tests {
 
     #[test]
     fn chains_are_replaced_wholesale_and_cycle() {
-        let p = parse("[chain]\ncolors = [\"FF0000\", \"00FF00\"]").unwrap();
+        let p = parse_palette("[chain]\ncolors = [\"FF0000\", \"00FF00\"]").unwrap();
         assert_eq!(p.chains.len(), 2);
         // b'A' = 65, so 65 % 2 = 1 picks the second entry.
         assert_eq!(p.chain("A"), Rgb::new(0, 255, 0));
@@ -509,14 +723,139 @@ mod tests {
     fn chain_colors_survive_being_written_after_other_sections() {
         // A bare top-level `chains = [...]` would bind to whichever [table]
         // preceded it. Keeping it in its own section makes order irrelevant.
-        let p = parse("[structure]\nhelix = \"FF0000\"\n\n[chain]\ncolors = [\"00FF00\"]").unwrap();
+        let p = parse_palette("[structure]\nhelix = \"FF0000\"\n\n[chain]\ncolors = [\"00FF00\"]")
+            .unwrap();
         assert_eq!(p.chains, vec![Rgb::new(0, 255, 0)]);
         assert_eq!(p.structure.helix, Rgb::new(255, 0, 0));
     }
 
     #[test]
+    fn a_colors_only_file_still_parses_after_the_config_grew() {
+        // The file was once nothing but colors, and those sections still sit at
+        // the top level.  Anyone who wrote one before fog and defaults existed
+        // keeps a working config.
+        let c = parse(
+            r#"
+            [structure]
+            helix = "112233"
+
+            [chain]
+            colors = ["FF0000"]
+
+            [element.symbols]
+            C = "010203"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(c.palette.structure.helix, Rgb::new(0x11, 0x22, 0x33));
+        assert_eq!(c.fog, Fog::default());
+        assert_eq!(c.defaults, Defaults::default());
+    }
+
+    #[test]
+    fn fog_overrides_apply_one_key_at_a_time() {
+        let c = parse("[fog]\nstrength = 0.15").unwrap();
+        assert_eq!(c.fog.strength, 0.15);
+        // Everything else about the fog is untouched.
+        assert_eq!(c.fog.max_strength, Fog::default().max_strength);
+        assert_eq!(c.fog.color, Fog::default().color);
+        assert_eq!(c.fog.desaturation, Fog::default().desaturation);
+    }
+
+    #[test]
+    fn fog_can_be_turned_off_outright() {
+        assert_eq!(parse("[fog]\nstrength = 0.0").unwrap().fog.strength, 0.0);
+    }
+
+    #[test]
+    fn out_of_range_fog_is_rejected_with_the_key_named() {
+        for (text, needle) in [
+            ("[fog]\nstrength = 1.5", "fog.strength"),
+            ("[fog]\ndesaturation = -0.2", "fog.desaturation"),
+            ("[fog]\nreference_depth = 0.0", "fog.reference_depth"),
+            ("[fog]\ncurve_gain = -1.0", "fog.curve_gain"),
+        ] {
+            let err = parse(text).unwrap_err().to_string();
+            assert!(
+                err.contains(needle),
+                "{text:?} gave an unhelpful error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fog_ceiling_below_its_own_strength_is_rejected() {
+        // Silently clamping would leave the file saying one thing and the
+        // renderer doing another.
+        let err = parse("[fog]\nstrength = 0.6\nmax_strength = 0.4")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("max_strength"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn defaults_parse_every_mode_name_the_cli_takes() {
+        let c = parse(
+            r#"
+            [defaults]
+            render = "hd+"
+            mode = "wireframe"
+            color = "b-factor"
+            ball_and_stick = false
+            ligands = false
+            auto_rotate = true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(c.defaults.render, Some(RenderMode::HalfBlockPlus));
+        assert_eq!(c.defaults.mode, Some(VizMode::Wireframe));
+        assert_eq!(c.defaults.color, Some(ColorSchemeType::BFactor));
+        assert_eq!(c.defaults.ball_and_stick, Some(false));
+        assert_eq!(c.defaults.ligands, Some(false));
+        assert_eq!(c.defaults.auto_rotate, Some(true));
+    }
+
+    #[test]
+    fn an_unset_default_stays_unset() {
+        // `None` is what lets the file-extension heuristics still run, so an
+        // omitted key must not resolve to a built-in value here.
+        let c = parse("[defaults]\nrender = \"fullhd\"").unwrap();
+        assert_eq!(c.defaults.render, Some(RenderMode::FullHD));
+        assert_eq!(c.defaults.mode, None);
+        assert_eq!(c.defaults.color, None);
+    }
+
+    #[test]
+    fn a_misspelled_mode_names_what_was_expected() {
+        let err = parse("[defaults]\nmode = \"cartoons\"")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cartoons"),
+            "should quote the bad value: {err}"
+        );
+        assert!(
+            err.contains("cartoon, backbone, wireframe"),
+            "should list the accepted values: {err}"
+        );
+    }
+
+    #[test]
+    fn unknown_keys_are_rejected_in_the_new_sections_too() {
+        for text in [
+            "[fog]\nstrenght = 0.2",
+            "[defaults]\nrender_mode = \"fullhd\"",
+        ] {
+            assert!(
+                parse(text).is_err(),
+                "a typo should be an error, not silence: {text:?}"
+            );
+        }
+    }
+
+    #[test]
     fn hex_accepts_optional_hash_and_any_case() {
-        let p = parse(
+        let p = parse_palette(
             r##"
             [structure]
             helix = "#aabbcc"

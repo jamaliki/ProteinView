@@ -6,6 +6,5 @@ pub mod framebuffer;
 pub mod hd;
 pub mod kitty_png;
 pub mod kitty_shm;
-pub mod palette;
 pub mod ribbon;
 pub mod snapshot;

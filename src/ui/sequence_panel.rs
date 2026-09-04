@@ -12,9 +12,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::app::App;
+use crate::config::palette;
 use crate::model::protein::{Chain, MoleculeType, SecondaryStructure};
 use crate::model::sequence::{GROUP, SeqRow, column_offset, molecule_label, one_letter};
-use crate::render::palette::palette;
 
 /// Width of the left gutter: a right-aligned residue number plus a space.
 pub const GUTTER: u16 = 7;
