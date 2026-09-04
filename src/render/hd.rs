@@ -43,14 +43,15 @@ pub fn render_hd_framebuffer(
     )
 }
 
-/// Like [`render_hd_framebuffer`], but aware that the caller intends to
-/// downsample the result by a factor of `ssaa` before display.
+/// Like [`render_hd_framebuffer`], but aware that the framebuffer is not the
+/// size the result will be shown at.
 ///
-/// `width` / `height` are the *supersampled* framebuffer dimensions, i.e. the
-/// output resolution already multiplied by `ssaa`.  The factor is needed
-/// separately because line thickness and circle radii must be derived from the
-/// **output** resolution and then scaled up, so that features downsample to the
-/// same apparent size rather than becoming proportionally thinner.
+/// `render_scale` is this framebuffer's size relative to the display: `2.0`
+/// when HDplus supersamples and box-filters back down, `0.5` when FullHD
+/// renders small during interaction and the terminal stretches it back out.
+/// It has to be given separately because line thickness and circle radii are
+/// chosen for the resolution the *viewer* sees, then scaled into framebuffer
+/// units -- otherwise features change apparent size whenever the scale does.
 #[allow(clippy::too_many_arguments)]
 pub fn render_hd_framebuffer_ssaa(
     protein: &Protein,
@@ -63,7 +64,7 @@ pub fn render_hd_framebuffer_ssaa(
     show_ligands: bool,
     interactions: &[Interaction],
     selection: Option<SelectionView<'_>>,
-    ssaa: f64,
+    render_scale: f64,
 ) -> Framebuffer {
     let px_w = width as usize;
     let px_h = height as usize;
@@ -76,23 +77,29 @@ pub fn render_hd_framebuffer_ssaa(
     let half_w = px_w as f64 / 2.0;
     let half_h = px_h as f64 / 2.0;
 
-    // Scale line thickness and circle radii relative to the *output* size.
-    // Values were tuned at ~160px wide (braille resolution) where 1.5px
-    // lines and circles look correct.  At FullHD (~640px+) we scale up
-    // proportionally.  Floor of 1.0 preserves the original look at low
+    // Scale line thickness and circle radii relative to the size the user
+    // actually sees.  Values were tuned at ~160px wide (braille resolution)
+    // where 1.5px lines and circles look correct.  At FullHD (~640px+) we scale
+    // up proportionally.  Floor of 1.0 preserves the original look at low
     // resolutions; ceiling of 3.0 caps growth on 4K terminals.
     //
-    // When supersampling, the clamp must be evaluated against the resolution
-    // the user actually sees and only then multiplied by `ssaa`.  Deriving it
-    // from the supersampled width instead would let the clamp floor absorb the
-    // factor and render features too thin once downsampled.
-    let ssaa = if ssaa.is_finite() && ssaa >= 1.0 {
-        ssaa
+    // `render_scale` is how big this framebuffer is relative to what ends up on
+    // screen: above 1.0 when supersampling for HDplus, below 1.0 when FullHD
+    // renders small during interaction and lets the terminal stretch the result
+    // back out.  Either way the clamp has to be evaluated at the *displayed*
+    // size and only then scaled, or the clamp silently changes feature sizes.
+    //
+    // Getting this wrong is very visible: at a 2880px-wide viewport the clamp
+    // saturates at 3.0, so halving the render resolution moved `ts` only from
+    // 3.00 to 2.88 -- and the terminal then doubled it, making every atom
+    // 1.9x larger the moment the structure started rotating.
+    let render_scale = if render_scale.is_finite() && render_scale > 0.0 {
+        render_scale
     } else {
         1.0
     };
-    let output_px_w = px_w as f64 / ssaa;
-    let ts = (output_px_w / 500.0).clamp(1.0, 3.0) * ssaa;
+    let display_px_w = px_w as f64 / render_scale;
+    let ts = (display_px_w / 500.0).clamp(1.0, 3.0) * render_scale;
 
     // Pre-compute sin/cos once for the entire frame instead of per-vertex.
     let cache = camera.projection_cache();

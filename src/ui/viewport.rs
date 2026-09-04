@@ -206,7 +206,7 @@ fn render_fullhd_viewport(
         cam.pan_y *= scale;
     }
 
-    let fb = hd::render_hd_framebuffer(
+    let fb = hd::render_hd_framebuffer_ssaa(
         &app.protein,
         &cam,
         &app.color_scheme,
@@ -217,6 +217,11 @@ fn render_fullhd_viewport(
         app.show_ligands,
         interactions,
         selection,
+        // The terminal stretches a reduced-resolution frame back over the
+        // viewport, so atom and bond sizes have to be chosen for the displayed
+        // size, not the framebuffer's.  Without this they grow the moment the
+        // structure starts moving.
+        scale,
     );
 
     // If the terminal supports a real graphics protocol, hand it the pixels.
