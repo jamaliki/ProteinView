@@ -60,6 +60,7 @@ pub fn render_protein<'a>(
     show_ligands: bool,
     interactions: &'a [Interaction],
     selection: Option<SelectionView<'a>>,
+    outline_color: Option<[u8; 3]>,
 ) -> Canvas<'a, impl Fn(&mut Context<'_>) + 'a> {
     let mut canvas = Canvas::default()
         .marker(Marker::Braille)
@@ -71,17 +72,32 @@ pub fn render_protein<'a>(
         canvas = canvas.background_color(ratatui::style::Color::Rgb(bg.0[0], bg.0[1], bg.0[2]));
     }
     canvas.paint(move |ctx| {
+        if let Some(outline) = outline_color {
+            let outline = ratatui::style::Color::Rgb(outline[0], outline[1], outline[2]);
+            match viz_mode {
+                VizMode::Backbone | VizMode::Cartoon => {
+                    render_backbone(ctx, protein, camera, color_scheme, Some(outline), true);
+                }
+                VizMode::Wireframe => {
+                    render_wireframe(ctx, protein, camera, color_scheme, Some(outline), true);
+                }
+            }
+            if show_ligands {
+                render_ligands(ctx, protein, camera, color_scheme, Some(outline), true);
+            }
+        }
+
         match viz_mode {
             VizMode::Backbone | VizMode::Cartoon => {
-                render_backbone(ctx, protein, camera, color_scheme);
+                render_backbone(ctx, protein, camera, color_scheme, None, false);
             }
             VizMode::Wireframe => {
-                render_wireframe(ctx, protein, camera, color_scheme);
+                render_wireframe(ctx, protein, camera, color_scheme, None, false);
             }
         }
 
         if show_ligands {
-            render_ligands(ctx, protein, camera, color_scheme);
+            render_ligands(ctx, protein, camera, color_scheme, None, false);
         }
 
         if let Some(view) = selection.filter(|view| !view.selection.is_empty()) {
@@ -100,6 +116,8 @@ fn render_backbone(
     protein: &Protein,
     camera: &Camera,
     color_scheme: &ColorScheme,
+    color_override: Option<ratatui::style::Color>,
+    outline: bool,
 ) {
     let backbone = protein.backbone_atoms();
     if backbone.is_empty() {
@@ -107,7 +125,13 @@ fn render_backbone(
     }
 
     // Perpendicular offsets: centre line + 2 offsets on each side
-    let offsets: [f64; 5] = [0.0, 0.3, -0.3, 0.6, -0.6];
+    let normal_offsets = [0.0, 0.3, -0.3, 0.6, -0.6];
+    let outline_offsets = [0.0, 0.5, -0.5, 1.0, -1.0];
+    let offsets = if outline {
+        &outline_offsets
+    } else {
+        &normal_offsets
+    };
 
     let mut prev: Option<(f64, f64, &str)> = None;
     let mut prev_chain_id = "";
@@ -117,8 +141,9 @@ fn render_backbone(
 
         if chain.id == prev_chain_id {
             if let Some((px, py, _)) = prev {
-                let color = color_scheme.residue_color(residue, chain);
-                draw_thick_line(ctx, px, py, proj.x, proj.y, color, &offsets);
+                let color =
+                    color_override.unwrap_or_else(|| color_scheme.residue_color(residue, chain));
+                draw_thick_line(ctx, px, py, proj.x, proj.y, color, offsets);
             }
         }
 
@@ -133,8 +158,16 @@ fn render_wireframe(
     protein: &Protein,
     camera: &Camera,
     color_scheme: &ColorScheme,
+    color_override: Option<ratatui::style::Color>,
+    outline: bool,
 ) {
-    let offsets: [f64; 1] = [0.0];
+    let normal_offsets = [0.0];
+    let outline_offsets = [0.0, 0.55, -0.55];
+    let offsets: &[f64] = if outline {
+        &outline_offsets
+    } else {
+        &normal_offsets
+    };
 
     for chain in &protein.chains {
         // Process each residue: intra-residue bonds
@@ -156,8 +189,9 @@ fn render_wireframe(
                     let (a1, p1) = &projected[i];
                     let (a2, p2) = &projected[j];
                     if atoms_bonded(&a1.element, a1.x, a1.y, a1.z, &a2.element, a2.x, a2.y, a2.z) {
-                        let color = color_scheme.atom_color(a1, residue, chain);
-                        draw_thick_line(ctx, p1.x, p1.y, p2.x, p2.y, color, &offsets);
+                        let color = color_override
+                            .unwrap_or_else(|| color_scheme.atom_color(a1, residue, chain));
+                        draw_thick_line(ctx, p1.x, p1.y, p2.x, p2.y, color, offsets);
                     }
                 }
             }
@@ -186,8 +220,9 @@ fn render_wireframe(
             if let (Some(a1), Some(a2)) = (from_atom, to_atom) {
                 let p1 = camera.project(a1.x, a1.y, a1.z);
                 let p2 = camera.project(a2.x, a2.y, a2.z);
-                let color = color_scheme.atom_color(a1, res_curr, chain);
-                draw_thick_line(ctx, p1.x, p1.y, p2.x, p2.y, color, &offsets);
+                let color =
+                    color_override.unwrap_or_else(|| color_scheme.atom_color(a1, res_curr, chain));
+                draw_thick_line(ctx, p1.x, p1.y, p2.x, p2.y, color, offsets);
             }
         }
     }
@@ -199,8 +234,16 @@ fn render_ligands(
     protein: &Protein,
     camera: &Camera,
     color_scheme: &ColorScheme,
+    color_override: Option<ratatui::style::Color>,
+    outline: bool,
 ) {
-    let offsets: [f64; 1] = [0.0];
+    let normal_offsets = [0.0];
+    let outline_offsets = [0.0, 0.55, -0.55];
+    let offsets: &[f64] = if outline {
+        &outline_offsets
+    } else {
+        &normal_offsets
+    };
 
     for ligand in &protein.ligands {
         match ligand.ligand_type {
@@ -208,8 +251,9 @@ fn render_ligands(
                 // Single dot for ions — draw as a small cross for visibility
                 if let Some(atom) = ligand.atoms.first() {
                     let proj = camera.project(atom.x, atom.y, atom.z);
-                    let color = color_scheme.ligand_atom_color(atom, ligand);
-                    let sz = 0.5;
+                    let color = color_override
+                        .unwrap_or_else(|| color_scheme.ligand_atom_color(atom, ligand));
+                    let sz = if outline { 1.0 } else { 0.5 };
                     ctx.draw(&Line {
                         x1: proj.x - sz,
                         y1: proj.y,
@@ -233,7 +277,8 @@ fn render_ligands(
                     .iter()
                     .map(|a| {
                         let proj = camera.project(a.x, a.y, a.z);
-                        let color = color_scheme.ligand_atom_color(a, ligand);
+                        let color = color_override
+                            .unwrap_or_else(|| color_scheme.ligand_atom_color(a, ligand));
                         (a, proj, color)
                     })
                     .collect();
@@ -253,7 +298,7 @@ fn render_ligands(
                             a2.y,
                             a2.z,
                         ) {
-                            draw_thick_line(ctx, p1.x, p1.y, p2.x, p2.y, *color, &offsets);
+                            draw_thick_line(ctx, p1.x, p1.y, p2.x, p2.y, *color, offsets);
                         }
                     }
                 }

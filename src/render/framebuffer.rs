@@ -9,9 +9,9 @@ use crate::config::{Fog, palette};
 
 /// The palette's background color, if it configures one.
 ///
-/// Read at conversion time rather than baked into the framebuffer: the
-/// rasterizer's coverage test is "this pixel is not black", so painting the
-/// background in would make every empty pixel look drawn.
+/// Read at conversion time rather than baked into the framebuffer: finite
+/// depth is the authoritative coverage mask, so painting the background into
+/// every pixel would make empty space look drawn.
 fn background_color() -> Option<[u8; 3]> {
     palette().background.map(|rgb| rgb.0)
 }
@@ -342,6 +342,63 @@ impl Framebuffer {
                 let t = ((d - z_min) * inv_range).clamp(0.0, 1.0);
                 let step = ((t * last_step) as usize).min(FOG_RAMP_STEPS - 1);
                 blend_fog(c, fog_color, blend_ramp[step], desat_ramp[step]);
+            });
+    }
+
+    /// Trace an exterior screen-space silhouette around all rendered pixels.
+    ///
+    /// The original depth mask is expanded by `radius` pixels and only the new
+    /// exterior ring is colored, so the pass never replaces molecular color.
+    /// A finite sentinel depth marks the ring as rendered while keeping it
+    /// behind every real geometry sample during braille color selection.
+    pub fn apply_outline(&mut self, color: [u8; 3], radius: usize) {
+        if radius == 0 {
+            return;
+        }
+
+        let original: Vec<u8> = self
+            .depth
+            .par_iter()
+            .map(|depth| u8::from(depth.is_finite()))
+            .collect();
+        if !original.iter().any(|occupied| *occupied != 0) {
+            return;
+        }
+
+        let mut expanded = original.clone();
+        for _ in 0..radius {
+            let previous = expanded;
+            let mut next = previous.clone();
+            next.par_chunks_mut(self.width)
+                .enumerate()
+                .for_each(|(y, row)| {
+                    for (x, occupied) in row.iter_mut().enumerate() {
+                        if *occupied != 0 {
+                            continue;
+                        }
+                        let y0 = y.saturating_sub(1);
+                        let y1 = (y + 1).min(self.height - 1);
+                        let x0 = x.saturating_sub(1);
+                        let x1 = (x + 1).min(self.width - 1);
+                        if (y0..=y1).any(|near_y| {
+                            (x0..=x1).any(|near_x| previous[near_y * self.width + near_x] != 0)
+                        }) {
+                            *occupied = 1;
+                        }
+                    }
+                });
+            expanded = next;
+        }
+
+        self.color
+            .par_iter_mut()
+            .zip(self.depth.par_iter_mut())
+            .zip(original.par_iter().zip(expanded.par_iter()))
+            .for_each(|((pixel, depth), (&was_occupied, &is_occupied))| {
+                if was_occupied == 0 && is_occupied != 0 {
+                    *pixel = color;
+                    *depth = f32::MAX;
+                }
             });
     }
 
@@ -1170,12 +1227,15 @@ pub fn framebuffer_to_braille_widget_ssaa(
                         let row = sy * fb.width;
                         for sx in sx0..(sx0 + ssaa).min(fb.width) {
                             let c = fb.color[row + sx];
-                            if c != [0, 0, 0] {
+                            let z = fb.depth[row + sx];
+                            // Finite depth is the authoritative coverage mask.
+                            // The color fallback preserves compatibility with
+                            // test/utility framebuffers written without z.
+                            if z.is_finite() || c != [0, 0, 0] {
                                 covered += 1;
                                 r += c[0] as u32;
                                 g += c[1] as u32;
                                 b += c[2] as u32;
-                                let z = fb.depth[row + sx];
                                 if z < dot_near_z {
                                     dot_near_z = z;
                                     dot_near_c = c;
@@ -1416,6 +1476,36 @@ mod tests {
         // Farther fragment is rejected
         fb.set_pixel(1, 1, 4.0, [0, 0, 255]);
         assert_eq!(fb.color[1 * 4 + 1], [0, 255, 0]);
+    }
+
+    #[test]
+    fn outline_adds_only_an_exterior_ring() {
+        let mut fb = Framebuffer::new(7, 7);
+        fb.set_pixel(3, 3, 2.0, [200, 100, 50]);
+        fb.apply_outline([1, 2, 3], 1);
+
+        let drawn = fb.depth.iter().filter(|depth| depth.is_finite()).count();
+        assert_eq!(drawn, 9, "one pixel should gain its eight neighbours");
+        assert_eq!(fb.color[3 * 7 + 3], [200, 100, 50]);
+        assert_eq!(fb.depth[3 * 7 + 3], 2.0);
+        assert_eq!(fb.color[2 * 7 + 2], [1, 2, 3]);
+        assert_eq!(fb.depth[2 * 7 + 2], f32::MAX);
+        assert!(fb.depth[0].is_infinite());
+    }
+
+    #[test]
+    fn outline_radius_expands_without_filling_the_original() {
+        let mut fb = Framebuffer::new(7, 7);
+        fb.set_pixel(3, 3, 2.0, [200, 100, 50]);
+        fb.apply_outline([8, 9, 10], 2);
+
+        assert_eq!(
+            fb.depth.iter().filter(|depth| depth.is_finite()).count(),
+            25
+        );
+        assert_eq!(fb.color[3 * 7 + 3], [200, 100, 50]);
+        assert_eq!(fb.color[1 * 7 + 1], [8, 9, 10]);
+        assert!(fb.depth[0].is_infinite());
     }
 
     #[test]

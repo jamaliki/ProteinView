@@ -5,6 +5,7 @@ use ratatui_image::picker::ProtocolType;
 use ratatui_image::{Image, Resize};
 
 use crate::app::{self, App, ConnectionType, RenderMode};
+use crate::config::palette;
 use crate::model::interface::Interaction;
 use crate::model::residue_selection::SelectionView;
 use crate::render::braille;
@@ -77,6 +78,7 @@ pub fn render_viewport(frame: &mut Frame, area: Rect, app: &App) {
                 app.show_ligands,
                 interactions,
                 selection,
+                app.show_outline.then_some(palette().outline.color.0),
             );
 
             frame.render_widget(canvas, area);
@@ -89,7 +91,7 @@ pub fn render_viewport(frame: &mut Frame, area: Rect, app: &App) {
             let width = area.width as f64 * 2.0;
             let height = area.height as f64 * 4.0;
 
-            let fb = hd::render_hd_framebuffer(
+            let mut fb = hd::render_hd_framebuffer(
                 &app.protein,
                 &app.camera,
                 &app.color_scheme,
@@ -101,6 +103,9 @@ pub fn render_viewport(frame: &mut Frame, area: Rect, app: &App) {
                 interactions,
                 selection,
             );
+            if app.show_outline {
+                fb.apply_outline(palette().outline.color.0, 1);
+            }
 
             let widget = framebuffer_to_braille_widget(&fb);
             frame.render_widget(widget, area);
@@ -144,7 +149,7 @@ fn render_hdplus_viewport(
     let width = area.width as f64 * 2.0 * ssaa;
     let height = area.height as f64 * 4.0 * ssaa;
 
-    let fb = hd::render_hd_framebuffer_ssaa(
+    let mut fb = hd::render_hd_framebuffer_ssaa(
         &app.protein,
         &cam,
         &app.color_scheme,
@@ -157,6 +162,9 @@ fn render_hdplus_viewport(
         selection,
         ssaa,
     );
+    if app.show_outline {
+        fb.apply_outline(palette().outline.color.0, HD_SSAA);
+    }
 
     let widget =
         framebuffer_to_braille_widget_ssaa(&fb, HD_SSAA, hd_quant_step(app.connection_type));
@@ -206,7 +214,7 @@ fn render_fullhd_viewport(
         cam.pan_y *= scale;
     }
 
-    let fb = hd::render_hd_framebuffer_ssaa(
+    let mut fb = hd::render_hd_framebuffer_ssaa(
         &app.protein,
         &cam,
         &app.color_scheme,
@@ -223,6 +231,11 @@ fn render_fullhd_viewport(
         // structure starts moving.
         scale,
     );
+    if app.show_outline {
+        let display_radius = (still_w / 800.0).clamp(1.0, 3.0);
+        let render_radius = (display_radius * scale).round().max(1.0) as usize;
+        fb.apply_outline(palette().outline.color.0, render_radius);
+    }
 
     // If the terminal supports a real graphics protocol, hand it the pixels.
     if proto == ProtocolType::Kitty {
@@ -409,6 +422,23 @@ mod tests {
                 app.selection.set_range(0, 4, 9, true);
             });
             assert_ne!(plain, picked, "{mode:?} ignored the selection overlay");
+        }
+    }
+
+    #[test]
+    fn outline_changes_the_view_in_every_render_mode() {
+        let (cols, rows) = (100u16, 40u16);
+        for mode in [
+            RenderMode::Braille,
+            RenderMode::HalfBlock,
+            RenderMode::HalfBlockPlus,
+            RenderMode::FullHD,
+        ] {
+            let plain = draw_protein(fixture(), mode, cols, rows);
+            let outlined = draw_with(fixture(), mode, cols, rows, |app| {
+                app.show_outline = true;
+            });
+            assert_ne!(plain, outlined, "{mode:?} ignored outline mode");
         }
     }
 

@@ -189,6 +189,8 @@ pub struct App {
     pub render_mode: RenderMode,
     pub show_help: bool,
     pub show_ligands: bool,
+    /// Whether a palette-colored screen-space silhouette is drawn.
+    pub show_outline: bool,
     pub show_interface: bool,
     pub show_interactions: bool,
     pub interface_analysis: InterfaceAnalysis,
@@ -387,6 +389,7 @@ impl App {
             render_mode,
             show_help: false,
             show_ligands: defaults.ligands.unwrap_or(true),
+            show_outline: defaults.outline.unwrap_or(false),
             show_interface: false,
             show_interactions: false,
             interface_analysis,
@@ -438,6 +441,7 @@ impl App {
         };
         let auto_rotate = self.camera.auto_rotate;
         let show_ligands = self.show_ligands;
+        let show_outline = self.show_outline;
         let show_ball_stick = self.show_ball_stick;
         let kitty_shm = self.kitty_shm;
 
@@ -456,6 +460,7 @@ impl App {
         );
         replacement.camera.auto_rotate = auto_rotate;
         replacement.show_ligands = show_ligands;
+        replacement.show_outline = show_outline;
         replacement.show_ball_stick = show_ball_stick;
         replacement.kitty_shm = kitty_shm;
         replacement.needs_clear = true;
@@ -608,6 +613,10 @@ impl App {
 
     pub fn toggle_ligands(&mut self) {
         self.show_ligands = !self.show_ligands;
+    }
+
+    pub fn toggle_outline(&mut self) {
+        self.show_outline = !self.show_outline;
     }
 
     /// Get the cached ribbon mesh, regenerating if dirty.

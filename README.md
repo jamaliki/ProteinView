@@ -37,6 +37,7 @@ Terminal molecular structure viewer — load, rotate, and explore proteins, nucl
 - **Sequence panel** — scroll every chain's sequence, select residues, and show them as ball-and-stick in the 3D view
 - **7 color schemes** — structure, chain, element (CPK), B-factor, rainbow, pLDDT (AlphaFold)
 - **Interactive controls** — vim-style rotation, zoom, pan with auto-rotation
+- **Traced outlines** — optional palette-colored silhouettes across Braille, HD, HDplus, and FullHD
 - **PDB & mmCIF** — both formats supported, with RCSB PDB fetch (`--fetch`)
 - **Directory browser** — open a folder, choose structures from a persistent file panel, and keep FullHD interactive
 - **Headless FullHD export** — render a pixel-perfect PNG for agents and scripts without starting a nested TUI
@@ -160,6 +161,9 @@ proteinview examples/4HHB.pdb --hd
 # FullHD pixel mode (Kitty/Sixel terminals)
 proteinview examples/4HHB.pdb --fullhd
 
+# Add a traced silhouette (also toggle it interactively with o)
+proteinview examples/4HHB.pdb --fullhd --outline
+
 # Headless FullHD pixel snapshot (no alternate screen or terminal probing)
 proteinview examples/4HHB.pdb --snapshot 4HHB.png
 
@@ -247,7 +251,9 @@ with:
 `get_state` reports the active `palette` and the `palettes` available, so an
 agent can discover them rather than guessing. Naming one that does not exist is
 an `invalid_params` error listing the real names, and leaves the frame
-unchanged.
+unchanged. Outline state is exposed under `presentation.outline` and can be
+changed with `{"command":"toggle_outline"}` or
+`{"command":"set_outline","enabled":true}`.
 
 ## Keybindings
 
@@ -277,6 +283,7 @@ press `?` in either mode for the complete keybinding reference.
 | `f` | Interface analysis |
 | `I` | Interface interactions |
 | `g` | Toggle ligands |
+| `o` | Toggle traced outline |
 | `[`/`]` | Prev/next chain |
 | `S` | Sequence panel |
 | `b` | Ball-and-stick for the selection |
@@ -363,6 +370,22 @@ Every fixed color ProteinView draws can be changed. Colors are six hex digits,
 with or without a leading `#`, in either case. Element symbols merge onto the
 built-in CPK table, so overriding carbon leaves the rest alone, while
 `[chain] colors` replaces the chain cycle outright.
+
+Outline mode traces an exterior screen-space silhouette in every interactive
+render tier. Press `o`, pass `--outline`, or set `[defaults] outline = true`.
+Its color belongs to the active palette and defaults to a pale neutral that is
+visible on dark terminals:
+
+```toml
+[outline]
+color = "D8DEE9"
+
+[defaults]
+outline = true
+```
+
+For a light background, a dark outline such as `"111111"` usually works better.
+Named palettes use `[palette.outline] color = "..."`.
 
 ### The Rainbow ramp and the background
 

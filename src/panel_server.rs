@@ -47,6 +47,7 @@ pub struct PanelServerOptions {
     pub residue_colors: ResidueColorOverrides,
     pub viz_mode: VizMode,
     pub user_explicit_mode: bool,
+    pub show_outline: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +62,7 @@ struct PanelSettings {
     show_interface: bool,
     show_interactions: bool,
     show_ligands: bool,
+    show_outline: bool,
 }
 
 struct PanelSession {
@@ -131,6 +133,7 @@ impl PanelSession {
                 show_interface: false,
                 show_interactions: false,
                 show_ligands: true,
+                show_outline: options.show_outline,
             },
             interface_cache,
             has_plddt,
@@ -150,7 +153,7 @@ impl PanelSession {
         } else {
             &[]
         };
-        let framebuffer = hd::render_hd_framebuffer(
+        let mut framebuffer = hd::render_hd_framebuffer(
             &self.protein,
             &self.settings.camera,
             &self.color_scheme,
@@ -162,6 +165,12 @@ impl PanelSession {
             interactions,
             None,
         );
+        if self.settings.show_outline {
+            let radius = (f64::from(self.settings.width) / 800.0)
+                .clamp(1.0, 3.0)
+                .round() as usize;
+            framebuffer.apply_outline(crate::config::palette().outline.color.0, radius);
+        }
         let image = DynamicImage::ImageRgba8(framebuffer.to_rgba_image());
         write_png_atomically(&image, &self.output_path)?;
         self.revision = self
@@ -296,6 +305,7 @@ impl PanelSession {
                 "interface": self.settings.show_interface,
                 "interactions": self.settings.show_interactions,
                 "ligands": self.settings.show_ligands,
+                "outline": self.settings.show_outline,
                 "residue_colors": residue_colors,
             },
         })
@@ -420,6 +430,10 @@ enum PanelCommand {
     },
     ToggleLigands,
     SetLigands {
+        enabled: bool,
+    },
+    ToggleOutline,
+    SetOutline {
         enabled: bool,
     },
     ToggleAutoRotate,
@@ -783,6 +797,14 @@ fn apply_command(
             session.settings.show_ligands = enabled;
             Ok(CommandOutcome::Render)
         }
+        PanelCommand::ToggleOutline => {
+            session.settings.show_outline = !session.settings.show_outline;
+            Ok(CommandOutcome::Render)
+        }
+        PanelCommand::SetOutline { enabled } => {
+            session.settings.show_outline = enabled;
+            Ok(CommandOutcome::Render)
+        }
         PanelCommand::ToggleAutoRotate => {
             session.settings.camera.auto_rotate = !session.settings.camera.auto_rotate;
             session.settings.camera.reset_tick_timer();
@@ -876,6 +898,8 @@ fn is_supported_command(command: &str) -> bool {
             | "set_interactions"
             | "toggle_ligands"
             | "set_ligands"
+            | "toggle_outline"
+            | "set_outline"
             | "toggle_auto_rotate"
             | "set_auto_rotate"
             | "get_state"

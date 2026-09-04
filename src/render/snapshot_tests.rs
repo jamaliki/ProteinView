@@ -61,6 +61,7 @@ fn writes_a_fullhd_png_without_terminal_setup() {
             show_ligands: true,
             interface_chain: None,
             show_interactions: false,
+            show_outline: false,
         },
     )
     .unwrap();
@@ -70,6 +71,44 @@ fn writes_a_fullhd_png_without_terminal_setup() {
     assert_eq!(
         image::load_from_memory(&bytes).unwrap().dimensions(),
         (320, 180)
+    );
+}
+
+#[test]
+fn outline_expands_the_snapshot_silhouette() {
+    let dir = tempdir().unwrap();
+    let render = |name: &str, show_outline: bool| {
+        let output = dir.path().join(name);
+        save_png(
+            fixture_protein(),
+            &output,
+            SnapshotOptions {
+                width: 320,
+                height: 180,
+                color_override: None,
+                residue_colors: ResidueColorOverrides::default(),
+                viz_mode: VizMode::Backbone,
+                user_explicit_mode: true,
+                show_ligands: true,
+                interface_chain: None,
+                show_interactions: false,
+                show_outline,
+            },
+        )
+        .unwrap();
+        image::open(output)
+            .unwrap()
+            .to_rgba8()
+            .pixels()
+            .filter(|pixel| pixel[3] > 0)
+            .count()
+    };
+
+    let plain = render("plain.png", false);
+    let outlined = render("outlined.png", true);
+    assert!(
+        outlined > plain,
+        "outline should expand the opaque silhouette"
     );
 }
 
@@ -89,6 +128,7 @@ fn rejects_oversized_snapshot_dimensions() {
             show_ligands: true,
             interface_chain: None,
             show_interactions: false,
+            show_outline: false,
         },
     )
     .unwrap_err();
@@ -112,6 +152,7 @@ fn rejects_an_unknown_interface_chain() {
             show_ligands: true,
             interface_chain: Some("Z".to_string()),
             show_interactions: true,
+            show_outline: false,
         },
     )
     .unwrap_err();

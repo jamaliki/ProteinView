@@ -264,6 +264,23 @@ impl Default for SelectionPalette {
     }
 }
 
+/// Screen-space silhouette color used by outline mode.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OutlinePalette {
+    pub color: Rgb,
+}
+
+impl Default for OutlinePalette {
+    fn default() -> Self {
+        Self {
+            // Visible against the transparent/dark background used by most
+            // terminals. Light themes can override this with a dark ink.
+            color: Rgb::new(216, 222, 233),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Depth fog
 // ---------------------------------------------------------------------------
@@ -384,6 +401,8 @@ pub struct Defaults {
     pub ligands: Option<bool>,
     /// Spin the structure when nothing else is driving the camera.
     pub auto_rotate: Option<bool>,
+    /// Trace a screen-space silhouette around rendered structures.
+    pub outline: Option<bool>,
 }
 
 /// Deserialize one of the mode names, reusing the parser the CLI uses so the
@@ -450,6 +469,7 @@ pub struct Palette {
     pub interface: InterfacePalette,
     pub ligand: LigandPalette,
     pub selection: SelectionPalette,
+    pub outline: OutlinePalette,
     /// Color stops for the Rainbow scheme, N-terminus first, interpolated
     /// across the chain.  `None` keeps the built-in HSV sweep.
     pub rainbow: Option<Vec<Rgb>>,
@@ -480,6 +500,7 @@ impl Default for Palette {
             interface: InterfacePalette::default(),
             ligand: LigandPalette::default(),
             selection: SelectionPalette::default(),
+            outline: OutlinePalette::default(),
             rainbow: None,
             background: None,
         }
@@ -632,6 +653,7 @@ struct PaletteFile {
     interface: InterfacePalette,
     ligand: LigandPalette,
     selection: SelectionPalette,
+    outline: OutlinePalette,
     rainbow: RainbowFile,
     background: BackgroundFile,
 }
@@ -655,6 +677,7 @@ impl PaletteFile {
             interface: self.interface,
             ligand: self.ligand,
             selection: self.selection,
+            outline: self.outline,
             rainbow: None,
             background: self.background.color,
         };
@@ -706,6 +729,7 @@ struct ConfigFile {
     interface: InterfacePalette,
     ligand: LigandPalette,
     selection: SelectionPalette,
+    outline: OutlinePalette,
     rainbow: RainbowFile,
     background: BackgroundFile,
     fog: Fog,
@@ -728,6 +752,7 @@ impl ConfigFile {
             interface: self.interface,
             ligand: self.ligand,
             selection: self.selection,
+            outline: self.outline,
             rainbow: self.rainbow,
             background: self.background,
         };
@@ -1063,6 +1088,7 @@ mod tests {
             ball_and_stick = false
             ligands = false
             auto_rotate = true
+            outline = true
             "#,
         )
         .unwrap();
@@ -1072,6 +1098,31 @@ mod tests {
         assert_eq!(c.defaults.ball_and_stick, Some(false));
         assert_eq!(c.defaults.ligands, Some(false));
         assert_eq!(c.defaults.auto_rotate, Some(true));
+        assert_eq!(c.defaults.outline, Some(true));
+    }
+
+    #[test]
+    fn outline_color_is_palette_scoped_and_configurable() {
+        let c = parse(
+            r#"
+            [outline]
+            color = "112233"
+
+            [[palette]]
+            name = "paper"
+            [palette.outline]
+            color = "AABBCC"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            c.palettes[0].palette.outline.color,
+            Rgb::new(0x11, 0x22, 0x33)
+        );
+        assert_eq!(
+            c.palettes[1].palette.outline.color,
+            Rgb::new(0xAA, 0xBB, 0xCC)
+        );
     }
 
     #[test]

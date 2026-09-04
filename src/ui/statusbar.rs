@@ -82,6 +82,7 @@ fn fitting_hints(
             ("hjkl", "rotate"),
             ("wasd", "pan"),
             ("+/-", "zoom"),
+            ("o", "outline"),
             ("Tab", "editor"),
             ("e", "files"),
         ],
@@ -89,6 +90,7 @@ fn fitting_hints(
             ("hjkl", "rotate"),
             ("wasd", "pan"),
             ("+/-", "zoom"),
+            ("o", "outline"),
             ("m/M", "quality"),
         ],
     };

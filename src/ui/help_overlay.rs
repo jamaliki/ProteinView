@@ -87,6 +87,10 @@ pub fn render_help_overlay(frame: &mut Frame, area: Rect) {
             Span::raw("Toggle ligand visibility"),
         ]),
         Line::from(vec![
+            Span::styled("  o          ", Style::default().fg(Color::Yellow)),
+            Span::raw("Toggle traced outline"),
+        ]),
+        Line::from(vec![
             Span::styled("  Space      ", Style::default().fg(Color::Yellow)),
             Span::raw("Toggle auto-rotation"),
         ]),

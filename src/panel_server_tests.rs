@@ -52,6 +52,7 @@ fn options(width: u32, height: u32) -> PanelServerOptions {
         residue_colors: ResidueColorOverrides::default(),
         viz_mode: VizMode::Backbone,
         user_explicit_mode: true,
+        show_outline: false,
     }
 }
 
@@ -268,12 +269,13 @@ fn presentation_commands_update_authoritative_state() {
 {"id":4,"command":"set_interface","enabled":true}
 {"id":5,"command":"set_interactions","enabled":true}
 {"id":6,"command":"set_ligands","enabled":false}
-{"id":7,"command":"get_state"}
-{"id":8,"command":"shutdown"}
+{"id":7,"command":"set_outline","enabled":true}
+{"id":8,"command":"get_state"}
+{"id":9,"command":"shutdown"}
 "#,
     );
 
-    let state = &response_with_id(&records, 7)["state"];
+    let state = &response_with_id(&records, 8)["state"];
     assert_eq!(state["presentation"]["color"], "chain");
     assert_eq!(state["presentation"]["effective_color"], "interface");
     assert_eq!(state["presentation"]["viz_mode"], "wireframe");
@@ -282,6 +284,7 @@ fn presentation_commands_update_authoritative_state() {
     assert_eq!(state["presentation"]["interface"], true);
     assert_eq!(state["presentation"]["interactions"], true);
     assert_eq!(state["presentation"]["ligands"], false);
+    assert_eq!(state["presentation"]["outline"], true);
 }
 
 #[test]

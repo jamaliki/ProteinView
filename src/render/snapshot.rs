@@ -35,6 +35,7 @@ pub struct SnapshotOptions {
     pub show_ligands: bool,
     pub interface_chain: Option<String>,
     pub show_interactions: bool,
+    pub show_outline: bool,
 }
 
 /// Rasterize one ProteinView FullHD frame and write it as a PNG.
@@ -110,7 +111,7 @@ pub fn save_png(mut protein: Protein, output_path: &Path, options: SnapshotOptio
     } else {
         &[]
     };
-    let framebuffer = hd::render_hd_framebuffer(
+    let mut framebuffer = hd::render_hd_framebuffer(
         &protein,
         &camera,
         &color_scheme,
@@ -122,6 +123,10 @@ pub fn save_png(mut protein: Protein, output_path: &Path, options: SnapshotOptio
         interactions,
         None,
     );
+    if options.show_outline {
+        let radius = (f64::from(options.width) / 800.0).clamp(1.0, 3.0).round() as usize;
+        framebuffer.apply_outline(crate::config::palette().outline.color.0, radius);
+    }
     let image = DynamicImage::ImageRgba8(framebuffer.to_rgba_image());
     write_png_atomically(&image, output_path)
 }

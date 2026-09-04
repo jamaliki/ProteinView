@@ -51,6 +51,10 @@ struct Cli {
     #[arg(long, alias = "pixel")]
     fullhd: bool,
 
+    /// Trace a screen-space outline around the rendered structure
+    #[arg(long)]
+    outline: bool,
+
     /// Render mode: braille, halfblock (or hd), hdplus (or hd+), fullhd (or pixel)
     /// [default: braille, or `defaults.render` from the config file]
     #[arg(long = "render", value_name = "MODE")]
@@ -388,6 +392,7 @@ fn main() -> Result<()> {
     } else {
         (color_override, viz_mode)
     };
+    let show_outline = cli.outline || defaults.outline.unwrap_or(false);
 
     // The panel server owns a persistent, terminal-independent render session.
     // It must start before raw mode, terminal probing, alternate-screen setup,
@@ -409,6 +414,7 @@ fn main() -> Result<()> {
                 residue_colors: residue_colors.clone(),
                 viz_mode,
                 user_explicit_mode,
+                show_outline,
             },
             stdin.lock(),
             stdout.lock(),
@@ -438,6 +444,7 @@ fn main() -> Result<()> {
                 show_ligands: !cli.snapshot_hide_ligands,
                 interface_chain: cli.snapshot_interface_chain.clone(),
                 show_interactions: cli.snapshot_interactions,
+                show_outline,
             },
         )?;
         eprintln!(
@@ -507,6 +514,7 @@ fn main() -> Result<()> {
         picker,
     );
     app.kitty_shm = kitty_shm;
+    app.show_outline = show_outline;
     log!(
         logfile,
         "app created: render_mode={:?} chains={} zoom={:.2}",
@@ -752,6 +760,7 @@ fn main() -> Result<()> {
                         }
                         KeyCode::Char('I') => app.toggle_interactions(),
                         KeyCode::Char('g') => app.toggle_ligands(),
+                        KeyCode::Char('o') => app.toggle_outline(),
                         KeyCode::Char('S') => app.toggle_sequence_panel(),
                         KeyCode::Char('b') => app.toggle_ball_stick(),
                         KeyCode::Char('z') => {
